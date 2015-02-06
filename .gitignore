@@ -39,6 +39,7 @@
 /src/*.[od]
 /src/*.gcda
 /src/*.gcno
+/src/*.0
 
 /test/test.sh
 test/include/test/jemalloc_test.h
