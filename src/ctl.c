@@ -2602,8 +2602,7 @@ label_return:
 }
 
 static int
-arenas_lookup_ctl(tsd_t *tsd, const size_t *mib,
-    size_t miblen, void *oldp, size_t *oldlenp, void *newp,
+arenas_lookup_ctl_impl(tsd_t *tsd, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen) {
 	int ret;
 	unsigned arena_ind;
@@ -2613,7 +2612,6 @@ arenas_lookup_ctl(tsd_t *tsd, const size_t *mib,
 
 	ptr = NULL;
 	ret = EINVAL;
-	malloc_mutex_lock(tsd_tsdn(tsd), &ctl_mtx);
 	WRITE(ptr, void *);
 	extent = iealloc(tsd_tsdn(tsd), ptr);
 	if (extent == NULL)
@@ -2628,8 +2626,28 @@ arenas_lookup_ctl(tsd_t *tsd, const size_t *mib,
 
 	ret = 0;
 label_return:
+	return ret;
+}
+
+static int
+arenas_lookup_ctl(tsd_t *tsd, const size_t *mib, size_t miblen, void *oldp,
+		size_t *oldlenp, void *newp, size_t newlen) {
+	malloc_mutex_lock(tsd_tsdn(tsd), &ctl_mtx);
+	int ret = arenas_lookup_ctl_impl(tsd, oldp, oldlenp, newp, newlen);
 	malloc_mutex_unlock(tsd_tsdn(tsd), &ctl_mtx);
 	return ret;
+}
+
+unsigned
+arena_lookup(const void *p) {
+	unsigned arena;
+	size_t sz = sizeof(arena);
+
+	if (arenas_lookup_ctl_impl(tsd_fetch(), &arena, &sz, &p, sizeof(p)) != 0) {
+		return (unsigned)-1;
+	}
+
+	return arena;
 }
 
 /******************************************************************************/
