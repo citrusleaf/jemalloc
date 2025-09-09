@@ -765,8 +765,39 @@ arena_chunk_alloc(tsdn_t *tsdn, arena_t *arena)
 			return (NULL);
 	}
 
-	ql_elm_new(&chunk->node, ql_link);
-	ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
+	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
+		extent_node_t *first = arena->achunks.qlh_first;
+		extent_node_t *prev = NULL;
+
+		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		ql_elm_new(&chunk->node, ql_link);
+
+		if (first != NULL) {
+			mprotect((void *)first, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+
+			if (first->ql_link.qre_prev != first) {
+				prev = first->ql_link.qre_prev;
+				mprotect((void *)prev, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			}
+		}
+
+		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
+
+		if (first != NULL) {
+			mprotect((void *)first, 1 << LG_PAGE, PROT_READ);
+
+			if (prev != NULL) {
+				mprotect((void *)prev, 1 << LG_PAGE, PROT_READ);
+			}
+		}
+
+		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ);
+	}
+	else {
+		ql_elm_new(&chunk->node, ql_link);
+		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
+	}
+
 	arena_avail_insert(arena, chunk, map_bias, chunk_npages-map_bias);
 
 	return (chunk);
@@ -852,7 +883,36 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	/* Remove run from runs_avail, so that the arena does not use it. */
 	arena_avail_remove(arena, chunk, map_bias, chunk_npages-map_bias);
 
-	ql_remove(&arena->achunks, &chunk->node, ql_link);
+	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
+		extent_node_t* next = NULL;
+		extent_node_t* prev = NULL;
+
+		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+
+		if (chunk->node.ql_link.qre_next != &chunk->node) {
+			next = chunk->node.ql_link.qre_next;
+			mprotect(next, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			prev = chunk->node.ql_link.qre_prev;
+
+			if (next != prev) {
+				mprotect(prev, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			}
+		}
+
+		ql_remove(&arena->achunks, &chunk->node, ql_link);
+
+		if (next != NULL) {
+			mprotect(next, 1 << LG_PAGE, PROT_READ);
+
+			if (next != prev) {
+				mprotect(prev, 1 << LG_PAGE, PROT_READ);
+			}
+		}
+	}
+	else {
+		ql_remove(&arena->achunks, &chunk->node, ql_link);
+	}
+
 	spare = arena->spare;
 	arena->spare = chunk;
 	if (spare != NULL)
@@ -2033,6 +2093,18 @@ arena_reset(tsd_t *tsd, arena_t *arena)
 	    node != &arena->chunks_cache; node = qr_next(node, cc_link)) {
 		qr_new(&node->rd, rd_link);
 		qr_meld(&arena->runs_dirty, &node->rd, rd_link);
+	}
+
+	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
+		extent_node_t *first = arena->achunks.qlh_first;
+
+		if (first != NULL) {
+			node = first;
+
+			do {
+				mprotect(node, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			} while ((node = node->ql_link.qre_next) != first);
+		}
 	}
 
 	/* Arena chunks. */

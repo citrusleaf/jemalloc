@@ -1,3 +1,6 @@
+#include <sys/mman.h> // for mprotect devbuild
+#define MPROT_STARTUP_ARENA 149
+
 /******************************************************************************/
 #ifdef JEMALLOC_H_TYPES
 
@@ -923,8 +926,16 @@ arena_mapbits_allocated_get(const arena_chunk_t *chunk, size_t pageind)
 JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
+	arena_chunk_t *chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(mapbitsp);
 
-	*mapbitsp = mapbits;
+	if (chunk->node.en_arena->ind != MPROT_STARTUP_ARENA) {
+		mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		*mapbitsp = mapbits;
+		mprotect(chunk, 1 << LG_PAGE, PROT_READ);
+	}
+	else {
+		*mapbitsp = mapbits;
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
