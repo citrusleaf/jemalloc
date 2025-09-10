@@ -489,6 +489,8 @@ struct arena_s {
 	 * than or equal to the run size.
 	 */
 	arena_run_heap_t	runs_avail[NPSIZES];
+
+	pthread_mutex_t		dev_mprot;
 };
 
 /* Used in conjunction with tsd for fast arena-related context lookup. */
@@ -924,14 +926,45 @@ arena_mapbits_allocated_get(const arena_chunk_t *chunk, size_t pageind)
 }
 
 JEMALLOC_ALWAYS_INLINE void
+dev_protect(void *addr)
+{
+	int ret = mprotect(addr, 1 << LG_PAGE, PROT_READ);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_unprotect(void *addr)
+{
+	int ret = mprotect(addr, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_lock(arena_t *arena)
+{
+	int ret = pthread_mutex_lock(&arena->dev_mprot);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_unlock(arena_t *arena)
+{
+	int ret = pthread_mutex_unlock(&arena->dev_mprot);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
 	arena_chunk_t *chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(mapbitsp);
+	arena_t *arena = chunk->node.en_arena;
 
-	if (chunk->node.en_arena->ind != MPROT_STARTUP_ARENA) {
-		mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+	if (arena->ind != MPROT_STARTUP_ARENA) {
+		dev_lock(arena);
+		dev_unprotect(chunk);
 		*mapbitsp = mapbits;
-		mprotect(chunk, 1 << LG_PAGE, PROT_READ);
+		dev_protect(chunk);
+		dev_unlock(arena);
 	}
 	else {
 		*mapbitsp = mapbits;

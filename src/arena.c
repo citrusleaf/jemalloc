@@ -769,29 +769,31 @@ arena_chunk_alloc(tsdn_t *tsdn, arena_t *arena)
 		extent_node_t *first = arena->achunks.qlh_first;
 		extent_node_t *prev = NULL;
 
-		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		dev_lock(arena);
+		dev_unprotect(chunk);
 		ql_elm_new(&chunk->node, ql_link);
 
 		if (first != NULL) {
-			mprotect((void *)first, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			dev_unprotect(first);
 
 			if (first->ql_link.qre_prev != first) {
 				prev = first->ql_link.qre_prev;
-				mprotect((void *)prev, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+				dev_unprotect(prev);
 			}
 		}
 
 		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
 
 		if (first != NULL) {
-			mprotect((void *)first, 1 << LG_PAGE, PROT_READ);
+			dev_protect(first);
 
 			if (prev != NULL) {
-				mprotect((void *)prev, 1 << LG_PAGE, PROT_READ);
+				dev_protect(prev);
 			}
 		}
 
-		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ);
+		dev_protect(chunk);
+		dev_unlock(arena);
 	}
 	else {
 		ql_elm_new(&chunk->node, ql_link);
@@ -887,27 +889,30 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 		extent_node_t* next = NULL;
 		extent_node_t* prev = NULL;
 
-		mprotect((void *)chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		dev_lock(arena);
+		dev_unprotect(chunk);
 
 		if (chunk->node.ql_link.qre_next != &chunk->node) {
 			next = chunk->node.ql_link.qre_next;
-			mprotect(next, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+			dev_unprotect(next);
 			prev = chunk->node.ql_link.qre_prev;
 
 			if (next != prev) {
-				mprotect(prev, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+				dev_unprotect(prev);
 			}
 		}
 
 		ql_remove(&arena->achunks, &chunk->node, ql_link);
 
 		if (next != NULL) {
-			mprotect(next, 1 << LG_PAGE, PROT_READ);
+			dev_protect(next);
 
 			if (next != prev) {
-				mprotect(prev, 1 << LG_PAGE, PROT_READ);
+				dev_protect(prev);
 			}
 		}
+
+		dev_unlock(arena);
 	}
 	else {
 		ql_remove(&arena->achunks, &chunk->node, ql_link);
@@ -3768,6 +3773,10 @@ arena_new(tsdn_t *tsdn, unsigned ind)
 		arena_run_heap_new(&bin->runs);
 		if (config_stats)
 			memset(&bin->stats, 0, sizeof(malloc_bin_stats_t));
+	}
+
+	if (pthread_mutex_init(&arena->dev_mprot, NULL) != 0) {
+		return (NULL);
 	}
 
 	return (arena);
