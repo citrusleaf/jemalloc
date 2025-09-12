@@ -1820,8 +1820,12 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			 * is deallocated.
 			 */
 			if (config_thp && opt_thp && chunk->hugepage) {
+				dev_lock(arena);
+				dev_unprotect(chunk);
 				chunk->hugepage = pages_nohuge(chunk,
 				    chunksize);
+				dev_protect(chunk);
+				dev_unlock(arena);
 			}
 
 			assert(pageind + npages <= chunk_npages);
