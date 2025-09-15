@@ -940,10 +940,14 @@ dev_unprotect(void *addr)
 }
 
 JEMALLOC_ALWAYS_INLINE void
-dev_lock(arena_t *arena)
+dev_lock_unprot(arena_t *arena, void *addr)
 {
-	int ret = pthread_mutex_lock(&arena->dev_mprot);
+	int ret;
+	if (arena->ind == MPROT_STARTUP_ARENA)
+		return;
+	ret = pthread_mutex_lock(&arena->dev_mprot);
 	assert(ret == 0);
+	dev_unprotect(addr);
 }
 
 JEMALLOC_ALWAYS_INLINE void
@@ -954,21 +958,18 @@ dev_unlock(arena_t *arena)
 }
 
 JEMALLOC_ALWAYS_INLINE void
+dev_prot_unlock(arena_t *arena, void *addr)
+{
+	if (arena->ind == MPROT_STARTUP_ARENA)
+		return;
+	dev_protect(addr);
+	dev_unlock(arena);
+}
+
+JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
-	arena_chunk_t *chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(mapbitsp);
-	arena_t *arena = chunk->node.en_arena;
-
-	if (arena->ind != MPROT_STARTUP_ARENA) {
-		dev_lock(arena);
-		dev_unprotect(chunk);
-		*mapbitsp = mapbits;
-		dev_protect(chunk);
-		dev_unlock(arena);
-	}
-	else {
-		*mapbitsp = mapbits;
-	}
+	*mapbitsp = mapbits;
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -998,6 +999,7 @@ arena_mapbits_unallocated_set(arena_chunk_t *chunk, size_t pageind, size_t size,
 	assert((flags & CHUNK_MAP_FLAGS_MASK) == flags);
 	assert((flags & CHUNK_MAP_DECOMMITTED) == 0 || (flags &
 	    (CHUNK_MAP_DIRTY|CHUNK_MAP_UNZEROED)) == 0);
+
 	arena_mapbitsp_write(mapbitsp, arena_mapbits_size_encode(size) |
 	    CHUNK_MAP_BININD_INVALID | flags);
 }
