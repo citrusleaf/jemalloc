@@ -1,4 +1,5 @@
 #include <sys/mman.h> // for mprotect devbuild
+#include <linux/futex.h>
 #define MPROT_STARTUP_ARENA 149
 
 /******************************************************************************/
@@ -489,8 +490,6 @@ struct arena_s {
 	 * than or equal to the run size.
 	 */
 	arena_run_heap_t	runs_avail[NPSIZES];
-
-	pthread_mutex_t		dev_mprot;
 };
 
 /* Used in conjunction with tsd for fast arena-related context lookup. */
@@ -925,45 +924,153 @@ arena_mapbits_allocated_get(const arena_chunk_t *chunk, size_t pageind)
 	return (mapbits & CHUNK_MAP_ALLOCATED);
 }
 
-JEMALLOC_ALWAYS_INLINE void
-dev_protect(void *addr)
+inline static void
+sys_futex(void* uaddr, int op, int val)
 {
-	int ret = mprotect(addr, 1 << LG_PAGE, PROT_READ);
-	assert(ret == 0);
+	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
+}
+
+#define as_cas_acq(_target, _old_value, _new_value) __atomic_compare_exchange_n(_target, _old_value, _new_value, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
+#define as_load_rlx(_target) __atomic_load_n(_target, __ATOMIC_RELAXED)
+#define as_fas_acq(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_ACQUIRE)
+#define as_fas_rls(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_RELEASE)
+
+JEMALLOC_ALWAYS_INLINE void
+dev_mut_lock(uint32_t* m)
+{
+	uint32_t zero = 0;
+
+	if (likely(as_cas_acq(m, &zero, 1))) {
+		return; // was not locked
+	}
+
+	if (as_load_rlx(m) == 2) {
+		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	}
+
+	while (as_fas_acq(m, 2) != 0) {
+		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE void
-dev_unprotect(void *addr)
+//static void __attribute__ ((noinline))
+dev_mut_unlock(uint32_t* m)
 {
-	int ret = mprotect(addr, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
-	assert(ret == 0);
+	uint32_t check = as_fas_rls(m, 0);
+
+	if (unlikely(check == 2)) {
+		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
+	}
+	else {
+		assert(check != 0);
+	}
+}
+
+#define MULT 3486784401u
+#define MULT_INV 3396732273u
+
+typedef struct dev_mprot_lock_s {
+	uint32_t	m;
+	uint32_t 	check32;
+	const arena_t*	arena;
+} dev_mprot_lock_t;
+
+JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
+dev_get_mprot_lock(arena_chunk_t *chunk)
+{
+	return (dev_mprot_lock_t*)((uintptr_t)chunk + 0xd000 - sizeof(dev_mprot_lock_t));
 }
 
 JEMALLOC_ALWAYS_INLINE void
-dev_lock_unprot(arena_t *arena, void *addr)
+dev_init_mprot_lock(arena_chunk_t *chunk, const arena_t *arena)
 {
-	int ret;
-	if (arena->ind == MPROT_STARTUP_ARENA)
+	dev_mprot_lock_t* lock;
+
+	if (((uintptr_t)chunk & chunksize_mask) != 0 && chunk->node.en_size <= chunksize_mask) {
 		return;
-	ret = pthread_mutex_lock(&arena->dev_mprot);
-	assert(ret == 0);
-	dev_unprotect(addr);
+	}
+
+	lock = dev_get_mprot_lock(chunk);
+	lock->m = 0;
+	lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
+	lock->arena = arena;
+}
+
+JEMALLOC_ALWAYS_INLINE bool
+dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk, const arena_t *arena)
+{
+	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1 &&
+			lock->arena != arena) {
+		return false;
+	}
+	return true;
+}
+
+JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
+dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
+{
+	dev_mprot_lock_t* lock;
+
+	lock = dev_get_mprot_lock(chunk);
+
+	if (! dev_lock_check(lock, chunk, arena)) {
+		return NULL;
+	}
+
+	dev_mut_lock(&lock->m);
+	return lock;
 }
 
 JEMALLOC_ALWAYS_INLINE void
-dev_unlock(arena_t *arena)
+dev_unlock(dev_mprot_lock_t *lock)
 {
-	int ret = pthread_mutex_unlock(&arena->dev_mprot);
-	assert(ret == 0);
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_prot_unlock(arena_t *arena, void *addr)
-{
-	if (arena->ind == MPROT_STARTUP_ARENA)
+	if (lock == NULL) {
 		return;
-	dev_protect(addr);
-	dev_unlock(arena);
+	}
+	dev_mut_unlock(&lock->m);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_protect(arena_chunk_t *chunk)
+{
+	int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_unprotect(arena_chunk_t *chunk)
+{
+	int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+	assert(ret == 0);
+}
+
+JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
+dev_lock_unprot(const arena_t *arena, arena_chunk_t *chunk)
+{
+	if (arena->ind == MPROT_STARTUP_ARENA) {
+		return NULL;
+	}
+	else {
+		dev_mprot_lock_t *lock = dev_chunk_lock(chunk, arena);
+		assert(lock != NULL);
+		dev_unprotect(chunk);
+		return lock;
+	}
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_prot_unlock(const arena_t *arena, arena_chunk_t *chunk)
+{
+	if (arena->ind == MPROT_STARTUP_ARENA) {
+		return;
+	}
+	else {
+		dev_mprot_lock_t *lock = dev_get_mprot_lock(chunk);
+		assert(dev_lock_check(lock, chunk, arena));
+		dev_protect(chunk);
+		dev_unlock(lock);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE void
