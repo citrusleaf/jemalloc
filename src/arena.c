@@ -406,16 +406,18 @@ arena_run_split_remove(arena_t *arena, arena_chunk_t *chunk, size_t run_ind,
 		size_t flag_unzeroed_mask = (flags == 0) ? CHUNK_MAP_UNZEROED :
 		    0;
 
-		dev_lock_unprot(arena, chunk);
+		dev_mprot_lock_t *lock = dev_lock_unprot_check(chunk, arena,
+		    run_ind+need_pages, NULL);
 		arena_mapbits_unallocated_set(chunk, run_ind+need_pages,
 		    (rem_pages << LG_PAGE), flags |
 		    (arena_mapbits_unzeroed_get(chunk, run_ind+need_pages) &
 		    flag_unzeroed_mask));
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+total_pages-1, lock);
 		arena_mapbits_unallocated_set(chunk, run_ind+total_pages-1,
 		    (rem_pages << LG_PAGE), flags |
 		    (arena_mapbits_unzeroed_get(chunk, run_ind+total_pages-1) &
 		    flag_unzeroed_mask));
-		dev_prot_unlock(arena, chunk);
+		dev_prot_unlock(chunk, lock);
 		if (flag_dirty != 0) {
 			arena_run_dirty_insert(arena, chunk, run_ind+need_pages,
 			    rem_pages);
@@ -500,15 +502,18 @@ arena_run_split_large_helper(arena_t *arena, arena_run_t *run, size_t size,
 	    CHUNK_MAP_UNZEROED : 0;
 	flag_decommitted = (!commit && flag_decommitted != 0) ?
 	    CHUNK_MAP_DECOMMITTED : 0;
-	dev_lock_unprot(arena, chunk);
+	{
+	dev_mprot_lock_t *lock = dev_lock_unprot_check(chunk, arena, run_ind+need_pages-1, NULL);
 	arena_mapbits_large_set(chunk, run_ind+need_pages-1, 0, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    run_ind+need_pages-1)) | flag_decommitted);
+	lock = dev_lock_unprot_check(chunk, arena, run_ind, lock);
 	arena_mapbits_large_set(chunk, run_ind, size, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk, run_ind)) |
 	    flag_decommitted);
-	dev_prot_unlock(arena, chunk);
+	dev_prot_unlock(chunk, lock);
 	return (false);
+	}
 }
 
 static bool
@@ -535,6 +540,7 @@ arena_run_split_small(arena_t *arena, arena_run_t *run, size_t size,
 	arena_chunk_t *chunk;
 	arena_chunk_map_misc_t *miscelm;
 	size_t flag_dirty, flag_decommitted, run_ind, need_pages, i;
+	dev_mprot_lock_t *lock = NULL;
 
 	assert(binind != BININD_INVALID);
 
@@ -553,16 +559,16 @@ arena_run_split_small(arena_t *arena, arena_run_t *run, size_t size,
 	arena_run_split_remove(arena, chunk, run_ind, flag_dirty,
 	    flag_decommitted, need_pages);
 
-	dev_lock_unprot(arena, chunk);
 	for (i = 0; i < need_pages; i++) {
 		size_t flag_unzeroed = arena_mapbits_unzeroed_get(chunk,
 		    run_ind+i);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+i, lock);
 		arena_mapbits_small_set(chunk, run_ind+i, i, binind,
 		    flag_unzeroed);
 		if (config_debug && flag_dirty == 0 && flag_unzeroed == 0)
 			arena_run_page_validate_zeroed(chunk, run_ind+i);
 	}
-	dev_prot_unlock(arena, chunk);
+	dev_prot_unlock(chunk, lock);
 	JEMALLOC_VALGRIND_MAKE_MEM_UNDEFINED((void *)((uintptr_t)chunk +
 	    (run_ind << LG_PAGE)), (need_pages << LG_PAGE));
 	return (false);
@@ -774,27 +780,29 @@ arena_chunk_alloc(tsdn_t *tsdn, arena_t *arena)
 	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
 		extent_node_t *first = arena->achunks.qlh_first;
 		extent_node_t *prev = NULL;
+		dev_mprot_lock_t *first_lock = NULL;
+		dev_mprot_lock_t *prev_lock = NULL;
 
 		dev_init_mprot_lock(chunk, arena);
 		ql_elm_new(&chunk->node, ql_link);
 
 		if (first != NULL) {
-			dev_lock_unprot(arena, (arena_chunk_t*)first);
+			first_lock = dev_lock_unprot((arena_chunk_t*)first, arena);
 
 			if (first->ql_link.qre_prev != first) {
 				prev = first->ql_link.qre_prev;
-				dev_lock_unprot(arena, (arena_chunk_t*)prev);
+				prev_lock = dev_lock_unprot((arena_chunk_t*)prev, arena);
 			}
 		}
 
 		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
 
 		if (prev != NULL) {
-			dev_prot_unlock(arena, (arena_chunk_t*)prev);
+			dev_prot_unlock((arena_chunk_t*)prev, prev_lock);
 		}
 
 		if (first != NULL) {
-			dev_prot_unlock(arena, (arena_chunk_t*)first);
+			dev_prot_unlock((arena_chunk_t*)first, first_lock);
 		}
 
 		dev_protect(chunk);
@@ -892,15 +900,17 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
 		extent_node_t* next = NULL;
 		extent_node_t* prev = NULL;
-		dev_mprot_lock_t *lock = dev_lock_unprot(arena, chunk);
+		dev_mprot_lock_t *lock = dev_lock_unprot(chunk, arena);
+		dev_mprot_lock_t *next_lock = NULL;
+		dev_mprot_lock_t *prev_lock = NULL;
 
 		if (chunk->node.ql_link.qre_next != &chunk->node) {
 			next = chunk->node.ql_link.qre_next;
-			dev_lock_unprot(arena, (arena_chunk_t*)next);
+			next_lock = dev_lock_unprot((arena_chunk_t*)next, arena);
 			prev = chunk->node.ql_link.qre_prev;
 
 			if (next != prev) {
-				dev_lock_unprot(arena, (arena_chunk_t*)prev);
+				prev_lock = dev_lock_unprot((arena_chunk_t*)prev, arena);
 			}
 		}
 
@@ -908,10 +918,10 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 
 		if (next != NULL) {
 			if (next != prev) {
-				dev_prot_unlock(arena, (arena_chunk_t*)prev);
+				dev_prot_unlock((arena_chunk_t*)prev, prev_lock);
 			}
 
-			dev_prot_unlock(arena, (arena_chunk_t*)next);
+			dev_prot_unlock((arena_chunk_t*)next, next_lock);
 		}
 
 		dev_unlock(lock);
@@ -1811,6 +1821,7 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			    (arena_chunk_t *)CHUNK_ADDR2BASE(rdelm);
 			arena_chunk_map_misc_t *miscelm =
 			    arena_rd_to_miscelm(rdelm);
+			dev_mprot_lock_t *lock;
 			pageind = arena_miscelm_to_pageind(miscelm);
 			run_size = arena_mapbits_large_size_get(chunk, pageind);
 			npages = run_size >> LG_PAGE;
@@ -1822,10 +1833,10 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			 * is deallocated.
 			 */
 			if (config_thp && opt_thp && chunk->hugepage) {
-				dev_lock_unprot(arena, chunk);
+				lock = dev_lock_unprot(chunk, arena);
 				chunk->hugepage = pages_nohuge(chunk,
 				    chunksize);
-				dev_prot_unlock(arena, chunk);
+				dev_prot_unlock(chunk, lock);
 			}
 
 			assert(pageind + npages <= chunk_npages);
@@ -1844,9 +1855,10 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 				flags = flag_unzeroed;
 			}
 
-			dev_lock_unprot(arena, chunk);
+			lock = dev_lock_unprot_check(chunk, arena, pageind+npages-1, NULL);
 			arena_mapbits_large_set(chunk, pageind+npages-1, 0,
 			    flags);
+			lock = dev_lock_unprot_check(chunk, arena, pageind, lock);
 			arena_mapbits_large_set(chunk, pageind, run_size,
 			    flags);
 
@@ -1862,10 +1874,11 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			 * CHUNK_MAP_ALLOCATED bits, behavior is well defined.
 			 */
 			for (i = 1; i < npages-1; i++) {
+				lock = dev_lock_unprot_check(chunk, arena, pageind + i, lock);
 				arena_mapbits_internal_set(chunk, pageind+i,
 				    flag_unzeroed);
 			}
-			dev_prot_unlock(arena, chunk);
+			dev_prot_unlock(chunk, lock);
 		}
 
 		npurged += npages;
@@ -2160,6 +2173,7 @@ arena_run_coalesce(arena_t *arena, arena_chunk_t *chunk, size_t *p_size,
 		size_t nrun_size = arena_mapbits_unallocated_size_get(chunk,
 		    run_ind+run_pages);
 		size_t nrun_pages = nrun_size >> LG_PAGE;
+		dev_mprot_lock_t *lock;
 
 		/*
 		 * Remove successor from runs_avail; the coalesced run is
@@ -2185,11 +2199,12 @@ arena_run_coalesce(arena_t *arena, arena_chunk_t *chunk, size_t *p_size,
 		size += nrun_size;
 		run_pages += nrun_pages;
 
-		dev_lock_unprot(arena, chunk);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind, NULL);
 		arena_mapbits_unallocated_size_set(chunk, run_ind, size);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+run_pages-1, lock);
 		arena_mapbits_unallocated_size_set(chunk, run_ind+run_pages-1,
 		    size);
-		dev_prot_unlock(arena, chunk);
+		dev_prot_unlock(chunk, lock);
 	}
 
 	/* Try to coalesce backward. */
@@ -2200,6 +2215,7 @@ arena_run_coalesce(arena_t *arena, arena_chunk_t *chunk, size_t *p_size,
 		size_t prun_size = arena_mapbits_unallocated_size_get(chunk,
 		    run_ind-1);
 		size_t prun_pages = prun_size >> LG_PAGE;
+		dev_mprot_lock_t *lock;
 
 		run_ind -= prun_pages;
 
@@ -2226,11 +2242,12 @@ arena_run_coalesce(arena_t *arena, arena_chunk_t *chunk, size_t *p_size,
 		size += prun_size;
 		run_pages += prun_pages;
 
-		dev_lock_unprot(arena, chunk);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind, NULL);
 		arena_mapbits_unallocated_size_set(chunk, run_ind, size);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+run_pages-1, lock);
 		arena_mapbits_unallocated_size_set(chunk, run_ind+run_pages-1,
 		    size);
-		dev_prot_unlock(arena, chunk);
+		dev_prot_unlock(chunk, lock);
 	}
 
 	*p_size = size;
@@ -2266,6 +2283,7 @@ arena_run_dalloc(tsdn_t *tsdn, arena_t *arena, arena_run_t *run, bool dirty,
 	arena_chunk_t *chunk;
 	arena_chunk_map_misc_t *miscelm;
 	size_t size, run_ind, run_pages, flag_dirty, flag_decommitted;
+	dev_mprot_lock_t *lock;
 
 	chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(run);
 	miscelm = arena_run_to_miscelm(run);
@@ -2289,20 +2307,22 @@ arena_run_dalloc(tsdn_t *tsdn, arena_t *arena, arena_run_t *run, bool dirty,
 	flag_dirty = dirty ? CHUNK_MAP_DIRTY : 0;
 	flag_decommitted = decommitted ? CHUNK_MAP_DECOMMITTED : 0;
 
-	dev_lock_unprot(arena, chunk);
+	lock = dev_lock_unprot_check(chunk, arena, run_ind, NULL);
 	/* Mark pages as unallocated in the chunk map. */
 	if (dirty || decommitted) {
 		size_t flags = flag_dirty | flag_decommitted;
 		arena_mapbits_unallocated_set(chunk, run_ind, size, flags);
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+run_pages-1, lock);
 		arena_mapbits_unallocated_set(chunk, run_ind+run_pages-1, size,
 		    flags);
 	} else {
 		arena_mapbits_unallocated_set(chunk, run_ind, size,
 		    arena_mapbits_unzeroed_get(chunk, run_ind));
+		lock = dev_lock_unprot_check(chunk, arena, run_ind+run_pages-1, lock);
 		arena_mapbits_unallocated_set(chunk, run_ind+run_pages-1, size,
 		    arena_mapbits_unzeroed_get(chunk, run_ind+run_pages-1));
 	}
-	dev_prot_unlock(arena, chunk);
+	dev_prot_unlock(chunk, lock);
 
 	arena_run_coalesce(arena, chunk, &size, &run_ind, &run_pages,
 	    flag_dirty, flag_decommitted);
@@ -2348,6 +2368,7 @@ arena_run_trim_head(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 	size_t flag_decommitted = arena_mapbits_decommitted_get(chunk, pageind);
 	size_t flag_unzeroed_mask = (flag_dirty | flag_decommitted) == 0 ?
 	    CHUNK_MAP_UNZEROED : 0;
+	dev_mprot_lock_t *lock;
 
 	assert(oldsize > newsize);
 
@@ -2357,10 +2378,11 @@ arena_run_trim_head(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 	 * run first, in case of single-page runs.
 	 */
 	assert(arena_mapbits_large_size_get(chunk, pageind) == oldsize);
-	dev_lock_unprot(arena, chunk);
+	lock = dev_lock_unprot_check(chunk, arena, pageind+head_npages-1, NULL);
 	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    pageind+head_npages-1)) | flag_decommitted);
+	lock = dev_lock_unprot_check(chunk, arena, pageind, lock);
 	arena_mapbits_large_set(chunk, pageind, oldsize-newsize, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk, pageind)) |
 	    flag_decommitted);
@@ -2372,10 +2394,11 @@ arena_run_trim_head(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 		assert(arena_mapbits_dirty_get(chunk,
 		    pageind+head_npages+tail_npages-1) == flag_dirty);
 	}
+	lock = dev_lock_unprot_check(chunk, arena, pageind+head_npages, lock);
 	arena_mapbits_large_set(chunk, pageind+head_npages, newsize,
 	    flag_dirty | (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    pageind+head_npages)) | flag_decommitted);
-	dev_prot_unlock(arena, chunk);
+	dev_prot_unlock(chunk, lock);
 
 	arena_run_dalloc(tsdn, arena, run, false, false, (flag_decommitted !=
 	    0));
@@ -2394,6 +2417,7 @@ arena_run_trim_tail(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 	    CHUNK_MAP_UNZEROED : 0;
 	arena_chunk_map_misc_t *tail_miscelm;
 	arena_run_t *tail_run;
+	dev_mprot_lock_t *lock;
 
 	assert(oldsize > newsize);
 
@@ -2403,10 +2427,11 @@ arena_run_trim_tail(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 	 * run first, in case of single-page runs.
 	 */
 	assert(arena_mapbits_large_size_get(chunk, pageind) == oldsize);
-	dev_lock_unprot(arena, chunk);
+	lock = dev_lock_unprot_check(chunk, arena, pageind+head_npages-1, NULL);
 	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    pageind+head_npages-1)) | flag_decommitted);
+	lock = dev_lock_unprot_check(chunk, arena, pageind, lock);
 	arena_mapbits_large_set(chunk, pageind, newsize, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk, pageind)) |
 	    flag_decommitted);
@@ -2418,10 +2443,11 @@ arena_run_trim_tail(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 		assert(arena_mapbits_dirty_get(chunk,
 		    pageind+head_npages+tail_npages-1) == flag_dirty);
 	}
+	lock = dev_lock_unprot_check(chunk, arena, pageind+head_npages, lock);
 	arena_mapbits_large_set(chunk, pageind+head_npages, oldsize-newsize,
 	    flag_dirty | (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    pageind+head_npages)) | flag_decommitted);
-	dev_prot_unlock(arena, chunk);
+	dev_prot_unlock(chunk, lock);
 
 	tail_miscelm = arena_miscelm_get_mutable(chunk, pageind + head_npages);
 	tail_run = &tail_miscelm->run;
@@ -2979,6 +3005,7 @@ arena_prof_promoted(tsdn_t *tsdn, const void *ptr, size_t size)
 	arena_chunk_t *chunk;
 	size_t pageind;
 	szind_t binind;
+	dev_mprot_lock_t *lock;
 
 	cassert(config_prof);
 	assert(ptr != NULL);
@@ -2991,9 +3018,9 @@ arena_prof_promoted(tsdn_t *tsdn, const void *ptr, size_t size)
 	pageind = ((uintptr_t)ptr - (uintptr_t)chunk) >> LG_PAGE;
 	binind = size2index(size);
 	assert(binind < NBINS);
-	dev_lock_unprot(chunk->node.en_arena, chunk);
+	lock = dev_lock_unprot_check(chunk, chunk->node.en_arena, pageind, NULL);
 	arena_mapbits_large_binind_set(chunk, pageind, binind);
-	dev_prot_unlock(chunk->node.en_arena, chunk);
+	dev_prot_unlock(chunk, lock);
 
 	assert(isalloc(tsdn, ptr, false) == LARGE_MINCLASS);
 	assert(isalloc(tsdn, ptr, true) == size);
@@ -3311,14 +3338,17 @@ arena_ralloc_large_grow(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 		flag_dirty = arena_mapbits_dirty_get(chunk, pageind) |
 		    arena_mapbits_dirty_get(chunk, pageind+npages-1);
 		flag_unzeroed_mask = flag_dirty == 0 ? CHUNK_MAP_UNZEROED : 0;
-		dev_lock_unprot(arena, chunk);
+		{
+		dev_mprot_lock_t *lock = dev_lock_unprot_check(chunk, arena, pageind, NULL);
 		arena_mapbits_large_set(chunk, pageind, size + large_pad,
 		    flag_dirty | (flag_unzeroed_mask &
 		    arena_mapbits_unzeroed_get(chunk, pageind)));
+		lock = dev_lock_unprot_check(chunk, arena, pageind+npages-1, lock);
 		arena_mapbits_large_set(chunk, pageind+npages-1, 0, flag_dirty |
 		    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 		    pageind+npages-1)));
-		dev_prot_unlock(arena, chunk);
+		dev_prot_unlock(chunk, lock);
+		}
 
 		if (config_stats) {
 			szind_t oldindex = size2index(oldsize) - NBINS;

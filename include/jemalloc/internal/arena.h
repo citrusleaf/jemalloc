@@ -704,14 +704,31 @@ void	arena_sdalloc(tsdn_t *tsdn, void *ptr, size_t size, tcache_t *tcache,
 
 #if (defined(JEMALLOC_ENABLE_INLINE) || defined(JEMALLOC_ARENA_C_))
 #  ifdef JEMALLOC_ARENA_INLINE_A
+#define DEV_END_MAP_PAGEIND 306
+
+JEMALLOC_ALWAYS_INLINE bool
+dev_need_mprot(size_t pageind)
+{
+	size_t idx = pageind - map_bias;
+	return idx >= DEV_END_MAP_PAGEIND && idx < 497; // 497 at chunk + 0x1000 (beyond 1 page)
+}
+
 JEMALLOC_ALWAYS_INLINE arena_chunk_map_bits_t *
 arena_bitselm_get_mutable(arena_chunk_t *chunk, size_t pageind)
 {
+	size_t idx = pageind - map_bias;
 
 	assert(pageind >= map_bias);
 	assert(pageind < chunk_npages);
 
-	return (&chunk->map_bits[pageind-map_bias]);
+	assert(((uintptr_t)chunk & chunksize_mask) == 0);
+	if (idx < DEV_END_MAP_PAGEIND) {
+		// use 32 bit maps
+		return (void*)((uintptr_t)chunk + 0xcb30 + idx * sizeof(uint32_t));
+	}
+
+	// normal 64 bit maps
+	return (&chunk->map_bits[idx]);
 }
 
 JEMALLOC_ALWAYS_INLINE const arena_chunk_map_bits_t *
@@ -802,8 +819,12 @@ arena_mapbitsp_get_const(const arena_chunk_t *chunk, size_t pageind)
 JEMALLOC_ALWAYS_INLINE size_t
 arena_mapbitsp_read(const size_t *mapbitsp)
 {
+	if (((uintptr_t)mapbitsp & chunksize_mask) <= 0x1008) { // 1 page and ind:497 ind:498
+		return (*mapbitsp);
+	}
 
-	return (*mapbitsp);
+	// was compressed to 32bits
+	return (size_t)(*(uint32_t*)mapbitsp);
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -953,8 +974,8 @@ dev_mut_lock(uint32_t* m)
 	}
 }
 
-JEMALLOC_ALWAYS_INLINE void
 //static void __attribute__ ((noinline))
+JEMALLOC_ALWAYS_INLINE void
 dev_mut_unlock(uint32_t* m)
 {
 	uint32_t check = as_fas_rls(m, 0);
@@ -965,15 +986,15 @@ dev_mut_unlock(uint32_t* m)
 	else {
 		assert(check != 0);
 	}
+
+	assert(check < 3);
 }
 
 #define MULT 3486784401u
-#define MULT_INV 3396732273u
 
 typedef struct dev_mprot_lock_s {
 	uint32_t	m;
 	uint32_t 	check32;
-	const arena_t*	arena;
 } dev_mprot_lock_t;
 
 JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
@@ -994,14 +1015,12 @@ dev_init_mprot_lock(arena_chunk_t *chunk, const arena_t *arena)
 	lock = dev_get_mprot_lock(chunk);
 	lock->m = 0;
 	lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
-	lock->arena = arena;
 }
 
 JEMALLOC_ALWAYS_INLINE bool
 dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk, const arena_t *arena)
 {
-	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1 &&
-			lock->arena != arena) {
+	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1) {
 		return false;
 	}
 	return true;
@@ -1010,9 +1029,7 @@ dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk, const a
 JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
 dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
 {
-	dev_mprot_lock_t* lock;
-
-	lock = dev_get_mprot_lock(chunk);
+	dev_mprot_lock_t* lock = dev_get_mprot_lock(chunk);
 
 	if (! dev_lock_check(lock, chunk, arena)) {
 		return NULL;
@@ -1025,9 +1042,7 @@ dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
 JEMALLOC_ALWAYS_INLINE void
 dev_unlock(dev_mprot_lock_t *lock)
 {
-	if (lock == NULL) {
-		return;
-	}
+	assert(lock != NULL);
 	dev_mut_unlock(&lock->m);
 }
 
@@ -1046,7 +1061,7 @@ dev_unprotect(arena_chunk_t *chunk)
 }
 
 JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
-dev_lock_unprot(const arena_t *arena, arena_chunk_t *chunk)
+dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
 {
 	if (arena->ind == MPROT_STARTUP_ARENA) {
 		return NULL;
@@ -1059,15 +1074,24 @@ dev_lock_unprot(const arena_t *arena, arena_chunk_t *chunk)
 	}
 }
 
-JEMALLOC_ALWAYS_INLINE void
-dev_prot_unlock(const arena_t *arena, arena_chunk_t *chunk)
+JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
+dev_lock_unprot_check(arena_chunk_t *chunk, const arena_t *arena, size_t pageind, dev_mprot_lock_t *lock)
 {
-	if (arena->ind == MPROT_STARTUP_ARENA) {
-		return;
+	if (lock != NULL) {
+		return lock;
 	}
-	else {
-		dev_mprot_lock_t *lock = dev_get_mprot_lock(chunk);
-		assert(dev_lock_check(lock, chunk, arena));
+
+	if (arena->ind == MPROT_STARTUP_ARENA || ! dev_need_mprot(pageind)) {
+		return NULL;
+	}
+
+	return dev_lock_unprot(chunk, arena);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+dev_prot_unlock(arena_chunk_t *chunk, dev_mprot_lock_t *lock)
+{
+	if (lock != NULL) {
 		dev_protect(chunk);
 		dev_unlock(lock);
 	}
@@ -1076,7 +1100,13 @@ dev_prot_unlock(const arena_t *arena, arena_chunk_t *chunk)
 JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
-	*mapbitsp = mapbits;
+	if (((uintptr_t)mapbitsp & chunksize_mask) <= 0x1008) { // 1 page and ind:497 ind:498
+		*mapbitsp = mapbits;
+		return;
+	}
+
+	// compress to 32bits
+	*(uint32_t*)mapbitsp = (uint32_t)mapbits;
 }
 
 JEMALLOC_ALWAYS_INLINE size_t

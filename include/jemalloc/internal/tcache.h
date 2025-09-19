@@ -377,10 +377,10 @@ tcache_alloc_large(tsd_t *tsd, arena_t *arena, tcache_t *tcache, size_t size,
 			    (arena_chunk_t *)CHUNK_ADDR2BASE(ret);
 			size_t pageind = (((uintptr_t)ret - (uintptr_t)chunk) >>
 			    LG_PAGE);
-			dev_lock_unprot(arena, chunk);
+			dev_mprot_lock_t *lock = dev_lock_unprot_check(chunk, arena, pageind, NULL);
 			arena_mapbits_large_binind_set(chunk, pageind,
 			    BININD_INVALID);
-			dev_prot_unlock(arena, chunk);
+			dev_prot_unlock(chunk, lock);
 		}
 		if (likely(!zero)) {
 			if (slow_path && config_fill) {
