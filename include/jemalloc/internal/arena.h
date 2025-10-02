@@ -67,6 +67,43 @@ struct arena_run_s {
 	bitmap_t	bitmap[BITMAP_GROUPS_MAX];
 };
 
+typedef struct dev_gmm_s { // global mapped mem
+	uint32_t bit_maps[200]; // must be >= 199 to cover 499 bitmaps
+	uint64_t mark;
+	const arena_chunk_t *prev_owner;
+	const arena_chunk_t *owner;
+	struct dev_gmm_s *next;
+} __attribute__((packed)) dev_gmm_t;
+
+_Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
+
+extern dev_gmm_t *dev_mm_alloc();
+extern void dev_mm_free(dev_gmm_t *mm);
+extern bool dev_is_gmm(const void *ptr);
+
+#define MULT 3486784401u
+
+typedef struct dev_mprot_lock_s {
+	uint32_t	m;
+	uint32_t 	check32;
+} dev_mprot_lock_t;
+
+#define DEV_CMM_N_BITMAPS 300
+
+// dev mprotect
+typedef struct dev_cmm_s { // chunk mapped mem
+	const uint8_t __priv_mem[0xcb30]; // do not touch
+	const uint32_t padding0[2];
+	dev_mprot_lock_t lock __attribute__((aligned(4)));
+	uint32_t bit_maps[DEV_CMM_N_BITMAPS];
+	dev_gmm_t *gmm; // NULL means unmapped chunk
+	const uint32_t padding1[2];
+} __attribute__((packed)) dev_cmm_t;
+
+_Static_assert(sizeof(dev_cmm_t) == 0xd000, "Invalid CMM size");
+
+extern void *dev_get_bitmap(dev_cmm_t *dev_ptr, size_t idx);
+
 /* Each element of the chunk map corresponds to one page within the chunk. */
 struct arena_chunk_map_bits_s {
 	/*
@@ -704,31 +741,21 @@ void	arena_sdalloc(tsdn_t *tsdn, void *ptr, size_t size, tcache_t *tcache,
 
 #if (defined(JEMALLOC_ENABLE_INLINE) || defined(JEMALLOC_ARENA_C_))
 #  ifdef JEMALLOC_ARENA_INLINE_A
-#define DEV_END_MAP_PAGEIND 306
-
-JEMALLOC_ALWAYS_INLINE bool
-dev_need_mprot(size_t pageind)
-{
-	size_t idx = pageind - map_bias;
-	return idx >= DEV_END_MAP_PAGEIND && idx < 497; // 497 at chunk + 0x1000 (beyond 1 page)
-}
 
 JEMALLOC_ALWAYS_INLINE arena_chunk_map_bits_t *
 arena_bitselm_get_mutable(arena_chunk_t *chunk, size_t pageind)
 {
-	size_t idx = pageind - map_bias;
+	dev_cmm_t *dev_ptr = (dev_cmm_t*)chunk;
 
 	assert(pageind >= map_bias);
 	assert(pageind < chunk_npages);
 
-	assert(((uintptr_t)chunk & chunksize_mask) == 0);
-	if (idx < DEV_END_MAP_PAGEIND) {
-		// use 32 bit maps
-		return (void*)((uintptr_t)chunk + 0xcb30 + idx * sizeof(uint32_t));
+	if (dev_ptr->gmm != NULL) {
+		assert(((uintptr_t)chunk & chunksize_mask) == 0);
+		return dev_get_bitmap(dev_ptr, pageind-map_bias);
 	}
 
-	// normal 64 bit maps
-	return (&chunk->map_bits[idx]);
+	return (&chunk->map_bits[pageind-map_bias]);
 }
 
 JEMALLOC_ALWAYS_INLINE const arena_chunk_map_bits_t *
@@ -819,12 +846,13 @@ arena_mapbitsp_get_const(const arena_chunk_t *chunk, size_t pageind)
 JEMALLOC_ALWAYS_INLINE size_t
 arena_mapbitsp_read(const size_t *mapbitsp)
 {
-	if (((uintptr_t)mapbitsp & chunksize_mask) <= 0x1008) { // 1 page and ind:497 ind:498
-		return (*mapbitsp);
+	if (dev_is_gmm(mapbitsp) ||
+			((uintptr_t)mapbitsp & chunksize_mask) > 0x1008) {
+		// was compressed to 32bits
+		return (size_t)(*(uint32_t*)mapbitsp);
 	}
 
-	// was compressed to 32bits
-	return (size_t)(*(uint32_t*)mapbitsp);
+	return (*mapbitsp);
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -990,31 +1018,37 @@ dev_mut_unlock(uint32_t* m)
 	assert(check < 3);
 }
 
-#define MULT 3486784401u
-
-typedef struct dev_mprot_lock_s {
-	uint32_t	m;
-	uint32_t 	check32;
-} dev_mprot_lock_t;
-
 JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
 dev_get_mprot_lock(arena_chunk_t *chunk)
 {
-	return (dev_mprot_lock_t*)((uintptr_t)chunk + 0xd000 - sizeof(dev_mprot_lock_t));
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+	return &dchunk->lock;
 }
 
 JEMALLOC_ALWAYS_INLINE void
-dev_init_mprot_lock(arena_chunk_t *chunk, const arena_t *arena)
+dev_init_chunk(arena_chunk_t *chunk)
 {
-	dev_mprot_lock_t* lock;
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
 
-	if (((uintptr_t)chunk & chunksize_mask) != 0 && chunk->node.en_size <= chunksize_mask) {
+	assert(((uintptr_t)chunk & chunksize_mask) == 0);
+	assert(chunk->node.en_size > chunksize_mask);
+
+	if (chunk->node.en_arena->ind == MPROT_STARTUP_ARENA) {
+		dchunk->gmm = NULL;
 		return;
 	}
 
-	lock = dev_get_mprot_lock(chunk);
-	lock->m = 0;
-	lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
+	dchunk->gmm = dev_mm_alloc();
+
+	if (dchunk->gmm != NULL) {
+		dev_mprot_lock_t* lock = &dchunk->lock;
+		lock->m = 0;
+		lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
+		memset(dchunk->bit_maps, 0, sizeof(dchunk->bit_maps));
+		dchunk->gmm->prev_owner = dchunk->gmm->owner;
+		dchunk->gmm->owner = chunk;
+		dchunk->gmm->mark = ~(0UL);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE bool
@@ -1042,28 +1076,39 @@ dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
 JEMALLOC_ALWAYS_INLINE void
 dev_unlock(dev_mprot_lock_t *lock)
 {
-	assert(lock != NULL);
-	dev_mut_unlock(&lock->m);
+	if (lock != NULL) {
+		dev_mut_unlock(&lock->m);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE void
 dev_protect(arena_chunk_t *chunk)
 {
-	int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
-	assert(ret == 0);
+	dev_cmm_t *dchunk = dchunk = (dev_cmm_t*)chunk;
+
+	if (dchunk->gmm != NULL) {
+		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
+		assert(ret == 0);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE void
 dev_unprotect(arena_chunk_t *chunk)
 {
-	int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
-	assert(ret == 0);
+	dev_cmm_t *dchunk = dchunk = (dev_cmm_t*)chunk;
+
+	if (dchunk->gmm != NULL) {
+		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		assert(ret == 0);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
 dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
 {
-	if (arena->ind == MPROT_STARTUP_ARENA) {
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+
+	if (dchunk->gmm == NULL) {
 		return NULL;
 	}
 	else {
@@ -1072,20 +1117,6 @@ dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
 		dev_unprotect(chunk);
 		return lock;
 	}
-}
-
-JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
-dev_lock_unprot_check(arena_chunk_t *chunk, const arena_t *arena, size_t pageind, dev_mprot_lock_t *lock)
-{
-	if (lock != NULL) {
-		return lock;
-	}
-
-	if (arena->ind == MPROT_STARTUP_ARENA || ! dev_need_mprot(pageind)) {
-		return NULL;
-	}
-
-	return dev_lock_unprot(chunk, arena);
 }
 
 JEMALLOC_ALWAYS_INLINE void
@@ -1100,13 +1131,14 @@ dev_prot_unlock(arena_chunk_t *chunk, dev_mprot_lock_t *lock)
 JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
-	if (((uintptr_t)mapbitsp & chunksize_mask) <= 0x1008) { // 1 page and ind:497 ind:498
-		*mapbitsp = mapbits;
+	if (dev_is_gmm(mapbitsp) ||
+			((uintptr_t)mapbitsp & chunksize_mask) > 0x1008) {
+		// compress to 32bits
+		*(uint32_t*)mapbitsp = (uint32_t)mapbits;
 		return;
 	}
 
-	// compress to 32bits
-	*(uint32_t*)mapbitsp = (uint32_t)mapbits;
+	*mapbitsp = mapbits;
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -1136,7 +1168,6 @@ arena_mapbits_unallocated_set(arena_chunk_t *chunk, size_t pageind, size_t size,
 	assert((flags & CHUNK_MAP_FLAGS_MASK) == flags);
 	assert((flags & CHUNK_MAP_DECOMMITTED) == 0 || (flags &
 	    (CHUNK_MAP_DIRTY|CHUNK_MAP_UNZEROED)) == 0);
-
 	arena_mapbitsp_write(mapbitsp, arena_mapbits_size_encode(size) |
 	    CHUNK_MAP_BININD_INVALID | flags);
 }
