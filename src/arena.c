@@ -958,7 +958,6 @@ static void
 arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 {
 	arena_chunk_t *spare;
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
 
 	assert(arena_mapbits_allocated_get(chunk, map_bias) == 0);
 	assert(arena_mapbits_allocated_get(chunk, chunk_npages-1) == 0);
@@ -974,7 +973,7 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	/* Remove run from runs_avail, so that the arena does not use it. */
 	arena_avail_remove(arena, chunk, map_bias, chunk_npages-map_bias);
 
-	if (dchunk->gmm != NULL) {
+	if (arena->ind != MPROT_STARTUP_ARENA) {
 		extent_node_t* next = NULL;
 		extent_node_t* prev = NULL;
 		dev_mprot_lock_t *lock = dev_lock_unprot(chunk, arena);
