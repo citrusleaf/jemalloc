@@ -579,7 +579,6 @@ arena_run_split_large_helper(arena_t *arena, arena_run_t *run, size_t size,
 	    CHUNK_MAP_UNZEROED : 0;
 	flag_decommitted = (!commit && flag_decommitted != 0) ?
 	    CHUNK_MAP_DECOMMITTED : 0;
-	{
 	arena_mapbits_large_set(chunk, run_ind+need_pages-1, 0, flag_dirty |
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 	    run_ind+need_pages-1)) | flag_decommitted);
@@ -587,7 +586,6 @@ arena_run_split_large_helper(arena_t *arena, arena_run_t *run, size_t size,
 	    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk, run_ind)) |
 	    flag_decommitted);
 	return (false);
-	}
 }
 
 static bool
@@ -1911,8 +1909,10 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			 * is deallocated.
 			 */
 			if (config_thp && opt_thp && chunk->hugepage) {
+				dev_mprot_lock_t *lock = dev_lock_unprot(chunk, arena);
 				chunk->hugepage = pages_nohuge(chunk,
 				    chunksize);
+				dev_prot_unlock(chunk, lock);
 			}
 
 			assert(pageind + npages <= chunk_npages);
@@ -1930,7 +1930,6 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 				    LG_PAGE, run_size) ? CHUNK_MAP_UNZEROED : 0;
 				flags = flag_unzeroed;
 			}
-
 			arena_mapbits_large_set(chunk, pageind+npages-1, 0,
 			    flags);
 			arena_mapbits_large_set(chunk, pageind, run_size,
@@ -3384,14 +3383,12 @@ arena_ralloc_large_grow(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk,
 		flag_dirty = arena_mapbits_dirty_get(chunk, pageind) |
 		    arena_mapbits_dirty_get(chunk, pageind+npages-1);
 		flag_unzeroed_mask = flag_dirty == 0 ? CHUNK_MAP_UNZEROED : 0;
-		{
 		arena_mapbits_large_set(chunk, pageind, size + large_pad,
 		    flag_dirty | (flag_unzeroed_mask &
 		    arena_mapbits_unzeroed_get(chunk, pageind)));
 		arena_mapbits_large_set(chunk, pageind+npages-1, 0, flag_dirty |
 		    (flag_unzeroed_mask & arena_mapbits_unzeroed_get(chunk,
 		    pageind+npages-1)));
-		}
 
 		if (config_stats) {
 			szind_t oldindex = size2index(oldsize) - NBINS;
