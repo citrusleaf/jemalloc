@@ -67,43 +67,6 @@ struct arena_run_s {
 	bitmap_t	bitmap[BITMAP_GROUPS_MAX];
 };
 
-typedef struct dev_gmm_s { // global mapped mem
-	uint32_t bit_maps[200]; // must be >= 199 to cover 499 bitmaps
-	uint64_t mark;
-	const arena_chunk_t *prev_owner;
-	const arena_chunk_t *owner;
-	struct dev_gmm_s *next;
-} __attribute__((packed)) dev_gmm_t;
-
-_Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
-
-extern dev_gmm_t *dev_mm_alloc();
-extern void dev_mm_free(dev_gmm_t *mm);
-extern bool dev_is_gmm(const void *ptr);
-
-#define MULT 3486784401u
-
-typedef struct dev_mprot_lock_s {
-	uint32_t	m;
-	uint32_t 	check32;
-} dev_mprot_lock_t;
-
-#define DEV_CMM_N_BITMAPS 300
-
-// dev mprotect
-typedef struct dev_cmm_s { // chunk mapped mem
-	const uint8_t __priv_mem[0xcb30]; // do not touch
-	const uint32_t padding0[2];
-	dev_mprot_lock_t lock __attribute__((aligned(4)));
-	uint32_t bit_maps[DEV_CMM_N_BITMAPS];
-	dev_gmm_t *gmm; // NULL means unmapped chunk
-	const uint32_t padding1[2];
-} __attribute__((packed)) dev_cmm_t;
-
-_Static_assert(sizeof(dev_cmm_t) == 0xd000, "Invalid CMM size");
-
-extern void *dev_get_bitmap(dev_cmm_t *dev_ptr, size_t idx);
-
 /* Each element of the chunk map corresponds to one page within the chunk. */
 struct arena_chunk_map_bits_s {
 	/*
@@ -222,6 +185,41 @@ typedef ph(arena_chunk_map_misc_t) arena_run_heap_t;
 #endif /* JEMALLOC_ARENA_STRUCTS_A */
 
 #ifdef JEMALLOC_ARENA_STRUCTS_B
+
+#define MULT 3486784401u
+
+typedef struct dev_mprot_lock_s {
+	uint32_t	m;
+	uint32_t 	check32;
+} dev_mprot_lock_t;
+
+typedef struct dev_gmm_s { // global mapped mem
+	uint32_t bit_maps[499];
+	uint64_t mark;
+	struct dev_gmm_s *next;
+	const arena_chunk_t *prev_owner;
+	const arena_chunk_t *owner;
+	dev_mprot_lock_t lock __attribute__((aligned(4)));
+	uint8_t padding[8];
+	uint32_t idx;
+} __attribute__((packed)) dev_gmm_t;
+
+_Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
+
+//#define DEV_CMM_N_BITMAPS 300
+
+// dev mprotect
+typedef struct dev_cmm_s { // chunk mapped mem
+	const extent_node_t __priv_node; // do not touch
+	bool hugepage;
+	bool gmm_mapped;
+	uint32_t gmm_idx;
+	const arena_chunk_map_bits_t __priv_map_bits[1]; // do not touch
+//} __attribute__((packed)) dev_cmm_t;
+} dev_cmm_t;
+
+_Static_assert(sizeof(dev_cmm_t) == 0x80, "Invalid CMM size");
+
 /* Arena chunk header. */
 struct arena_chunk_s {
 	/*
@@ -238,6 +236,8 @@ struct arena_chunk_s {
 	 * page controls.
 	 */
 	bool			hugepage;
+	const bool			__dev_gmm_mapped;
+	const uint32_t		__dev_gmm_idx;
 
 	/*
 	 * Map of pages within chunk that keeps track of free/large/small.  The
@@ -247,6 +247,8 @@ struct arena_chunk_s {
 	 */
 	arena_chunk_map_bits_t	map_bits[1]; /* Dynamically sized. */
 };
+
+_Static_assert(sizeof(struct arena_chunk_s) == 0x80, "Invalid arena_chunk_s size");
 
 /*
  * Read-only information associated with each element of arena_t's bins array
@@ -742,17 +744,29 @@ void	arena_sdalloc(tsdn_t *tsdn, void *ptr, size_t size, tcache_t *tcache,
 #if (defined(JEMALLOC_ENABLE_INLINE) || defined(JEMALLOC_ARENA_C_))
 #  ifdef JEMALLOC_ARENA_INLINE_A
 
+#define	dev_assert(e) do {							\
+	if (unlikely(!(e))) {				\
+		malloc_printf(						\
+		    "<jemalloc>: %s:%d: Failed assertion: \"%s\"\n",	\
+		    __FILE__, __LINE__, #e);				\
+		abort();						\
+	}								\
+} while (0)
+
+extern bool dev_is_gmm(const void *ptr);
+extern void *dev_cmm_get_bitmap(dev_cmm_t *dchunk, size_t idx);
+
 JEMALLOC_ALWAYS_INLINE arena_chunk_map_bits_t *
 arena_bitselm_get_mutable(arena_chunk_t *chunk, size_t pageind)
 {
-	dev_cmm_t *dev_ptr = (dev_cmm_t*)chunk;
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
 
 	assert(pageind >= map_bias);
 	assert(pageind < chunk_npages);
 
-	if (dev_ptr->gmm != NULL) {
-		assert(((uintptr_t)chunk & chunksize_mask) == 0);
-		return dev_get_bitmap(dev_ptr, pageind-map_bias);
+	if (dchunk->gmm_mapped) {
+		dev_assert(((uintptr_t)chunk & chunksize_mask) == 0);
+		return dev_cmm_get_bitmap(dchunk, pageind-map_bias);
 	}
 
 	return (&chunk->map_bits[pageind-map_bias]);
@@ -973,164 +987,11 @@ arena_mapbits_allocated_get(const arena_chunk_t *chunk, size_t pageind)
 	return (mapbits & CHUNK_MAP_ALLOCATED);
 }
 
-inline static void
-sys_futex(void* uaddr, int op, int val)
-{
-	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
-}
-
-#define as_cas_acq(_target, _old_value, _new_value) __atomic_compare_exchange_n(_target, _old_value, _new_value, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
-#define as_load_rlx(_target) __atomic_load_n(_target, __ATOMIC_RELAXED)
-#define as_fas_acq(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_ACQUIRE)
-#define as_fas_rls(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_RELEASE)
-
-JEMALLOC_ALWAYS_INLINE void
-dev_mut_lock(uint32_t* m)
-{
-	uint32_t zero = 0;
-
-	if (likely(as_cas_acq(m, &zero, 1))) {
-		return; // was not locked
-	}
-
-	if (as_load_rlx(m) == 2) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-
-	while (as_fas_acq(m, 2) != 0) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-}
-
-//static void __attribute__ ((noinline))
-JEMALLOC_ALWAYS_INLINE void
-dev_mut_unlock(uint32_t* m)
-{
-	uint32_t check = as_fas_rls(m, 0);
-
-	if (unlikely(check == 2)) {
-		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
-	}
-	else {
-		assert(check != 0);
-	}
-
-	assert(check < 3);
-}
-
-JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
-dev_get_mprot_lock(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-	return &dchunk->lock;
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_init_chunk(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	assert(((uintptr_t)chunk & chunksize_mask) == 0);
-	assert(chunk->node.en_size > chunksize_mask);
-
-	if (chunk->node.en_arena->ind == MPROT_STARTUP_ARENA) {
-		dchunk->gmm = NULL;
-		return;
-	}
-
-	dchunk->gmm = dev_mm_alloc();
-
-	if (dchunk->gmm != NULL) {
-		dev_mprot_lock_t* lock = &dchunk->lock;
-		lock->m = 0;
-		lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
-		memset(dchunk->bit_maps, 0, sizeof(dchunk->bit_maps));
-		dchunk->gmm->prev_owner = dchunk->gmm->owner;
-		dchunk->gmm->owner = chunk;
-		dchunk->gmm->mark = ~(0UL);
-	}
-}
-
-JEMALLOC_ALWAYS_INLINE bool
-dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk, const arena_t *arena)
-{
-	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1) {
-		return false;
-	}
-	return true;
-}
-
-JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t*
-dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
-{
-	dev_mprot_lock_t* lock = dev_get_mprot_lock(chunk);
-
-	if (! dev_lock_check(lock, chunk, arena)) {
-		return NULL;
-	}
-
-	dev_mut_lock(&lock->m);
-	return lock;
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_unlock(dev_mprot_lock_t *lock)
-{
-	if (lock != NULL) {
-		dev_mut_unlock(&lock->m);
-	}
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_protect(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm != NULL) {
-		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
-		assert(ret == 0);
-	}
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_unprotect(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm != NULL) {
-		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
-		assert(ret == 0);
-	}
-}
-
-JEMALLOC_ALWAYS_INLINE dev_mprot_lock_t *
-dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm == NULL) {
-		return NULL;
-	}
-	else {
-		dev_mprot_lock_t *lock = dev_chunk_lock(chunk, arena);
-		assert(lock != NULL);
-		dev_unprotect(chunk);
-		return lock;
-	}
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_prot_unlock(arena_chunk_t *chunk, dev_mprot_lock_t *lock)
-{
-	if (lock != NULL) {
-		dev_protect(chunk);
-		dev_unlock(lock);
-	}
-}
-
 JEMALLOC_ALWAYS_INLINE void
 arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
+	dev_assert(mapbits <= (size_t)UINT32_MAX);
+
 	if (dev_is_gmm(mapbitsp) ||
 			((uintptr_t)mapbitsp & chunksize_mask) > 0x1008) {
 		// compress to 32bits

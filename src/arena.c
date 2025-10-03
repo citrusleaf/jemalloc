@@ -33,6 +33,52 @@ dev_gmm_t dev_mapped_mem[DEV_MM_COUNT];
 uint32_t dev_mm_lock = 0;
 uint32_t dev_n_freed = 0;
 
+_Static_assert(sizeof(dev_mapped_mem) == 2048*DEV_MM_COUNT, "dev_mapped_mem");
+
+inline static void
+sys_futex(void* uaddr, int op, int val)
+{
+	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
+}
+
+#define as_cas_acq(_target, _old_value, _new_value) __atomic_compare_exchange_n(_target, _old_value, _new_value, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
+#define as_load_rlx(_target) __atomic_load_n(_target, __ATOMIC_RELAXED)
+#define as_fas_acq(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_ACQUIRE)
+#define as_fas_rls(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_RELEASE)
+
+static inline void
+dev_mut_lock(uint32_t* m)
+{
+	uint32_t zero = 0;
+
+	if (likely(as_cas_acq(m, &zero, 1))) {
+		return; // was not locked
+	}
+
+	if (as_load_rlx(m) == 2) {
+		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	}
+
+	while (as_fas_acq(m, 2) != 0) {
+		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	}
+}
+
+static inline void
+dev_mut_unlock(uint32_t* m)
+{
+	uint32_t check = as_fas_rls(m, 0);
+
+	if (unlikely(check == 2)) {
+		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
+	}
+	else {
+		dev_assert(check != 0);
+	}
+
+	dev_assert(check < 3);
+}
+
 static inline dev_gmm_t *
 dev_mm_get_freed()
 {
@@ -54,7 +100,7 @@ dev_mm_get_freed()
 	return NULL;
 }
 
-dev_gmm_t *
+static dev_gmm_t *
 dev_mm_alloc()
 {
 	dev_gmm_t *mm = dev_mm_get_freed();
@@ -67,20 +113,12 @@ dev_mm_alloc()
 		}
 
 		mm = &dev_mapped_mem[idx];
+		mm->idx = idx;
+		mm->mark = ~(0ULL);
 	}
 
 	memset(mm->bit_maps, 0, sizeof(mm->bit_maps));
 	return mm;
-}
-
-void
-dev_mm_free(dev_gmm_t *mm)
-{
-	dev_mut_lock(&dev_mm_lock);
-	mm->next = dev_free_ptr;
-	dev_free_ptr = mm;
-	dev_n_freed++;
-	dev_mut_unlock(&dev_mm_lock);
 }
 
 bool
@@ -94,16 +132,146 @@ dev_is_gmm(const void *ptr)
 	return false;
 }
 
-void *
-dev_get_bitmap(dev_cmm_t *dev_ptr, size_t idx)
+static void
+dev_cmm_free_mm(dev_cmm_t *dchunk)
 {
-	assert(dev_ptr->gmm != NULL);
+	dev_gmm_t *mm = &dev_mapped_mem[dchunk->gmm_idx];
 
-	if (idx < DEV_CMM_N_BITMAPS) {
-		return &dev_ptr->bit_maps[idx];
+	dev_mut_lock(&mm->lock.m);
+	mm->next = dev_free_ptr;
+	dev_free_ptr = mm;
+	dev_n_freed++;
+	dev_mut_unlock(&mm->lock.m);
+}
+
+static dev_mprot_lock_t *
+dev_cmm_get_lock(dev_cmm_t *dchunk)
+{
+	dev_assert(dchunk->gmm_idx < DEV_MM_COUNT);
+	return &dev_mapped_mem[dchunk->gmm_idx].lock;
+}
+
+void *
+dev_cmm_get_bitmap(dev_cmm_t *dchunk, size_t idx)
+{
+	dev_gmm_t *mm = &dev_mapped_mem[dchunk->gmm_idx];
+
+	dev_assert(dchunk->gmm_mapped);
+	dev_assert(idx < 499);
+
+	return &mm->bit_maps[idx];
+}
+
+JEMALLOC_ALWAYS_INLINE bool
+dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk,
+		const arena_t *arena)
+{
+	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1) {
+		return false;
 	}
+	return true;
+}
 
-	return &dev_ptr->gmm->bit_maps[idx - DEV_CMM_N_BITMAPS];
+JEMALLOC_ALWAYS_INLINE void
+dev_unlock(dev_mprot_lock_t *lock)
+{
+	if (lock != NULL) {
+		dev_mut_unlock(&lock->m);
+	}
+}
+
+/******************************************************************************/
+// arena_chunk_t
+static void
+dev_protect(arena_chunk_t *chunk)
+{
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+
+	if (dchunk->gmm_mapped) {
+		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
+		dev_assert(ret == 0);
+	}
+}
+
+static void
+dev_unprotect(arena_chunk_t *chunk)
+{
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+
+	if (dchunk->gmm_mapped) {
+		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+		dev_assert(ret == 0);
+	}
+}
+
+static dev_mprot_lock_t*
+dev_get_mprot_lock(arena_chunk_t *chunk)
+{
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+	dev_assert(dchunk->gmm_mapped);
+	return dev_cmm_get_lock(dchunk);
+}
+
+static dev_mprot_lock_t*
+dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
+{
+	dev_mprot_lock_t* lock = dev_get_mprot_lock(chunk);
+	dev_assert(dev_lock_check(lock, chunk, arena));
+	dev_mut_lock(&lock->m);
+	return lock;
+}
+
+static dev_mprot_lock_t *
+dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
+{
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+
+	if (! dchunk->gmm_mapped) {
+		return NULL;
+	}
+	else {
+		dev_mprot_lock_t *lock = dev_chunk_lock(chunk, arena);
+		dev_assert(lock != NULL);
+		dev_unprotect(chunk);
+		return lock;
+	}
+}
+
+static void
+dev_prot_unlock(arena_chunk_t *chunk, dev_mprot_lock_t *lock)
+{
+	if (lock != NULL) {
+		dev_protect(chunk);
+		dev_unlock(lock);
+	}
+}
+
+static void
+dev_init_chunk(arena_chunk_t *chunk)
+{
+	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
+
+	dev_assert(((uintptr_t)chunk & chunksize_mask) == 0);
+	dev_assert(chunk->node.en_size > chunksize_mask);
+
+	if (chunk->node.en_arena->ind == MPROT_STARTUP_ARENA) {
+		dchunk->gmm_mapped = false;
+		return;
+	}
+	else {
+		dev_gmm_t *gmm = dev_mm_alloc();
+
+		if (gmm != NULL) {
+			dev_mprot_lock_t* lock = &gmm->lock;
+			lock->m = 0;
+			lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
+			memset(gmm->bit_maps, 0, sizeof(gmm->bit_maps));
+			gmm->prev_owner = gmm->owner;
+			gmm->owner = chunk;
+			dchunk->gmm_mapped = true;
+			dchunk->gmm_idx = gmm->idx;
+		}
+	}
 }
 
 
@@ -896,9 +1064,10 @@ arena_chunk_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	chunk_hooks_t chunk_hooks = CHUNK_HOOKS_INITIALIZER;
 	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
 
-	if (dchunk->gmm != NULL) {
-		dev_mm_free(dchunk->gmm);
-		dchunk->gmm = NULL;
+	if (dchunk->gmm_mapped) {
+		dev_cmm_free_mm(dchunk);
+		dchunk->gmm_idx = ~(0U);
+		dchunk->gmm_mapped = false;
 	}
 
 	chunk_deregister(chunk, &chunk->node);
