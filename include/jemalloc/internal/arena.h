@@ -195,13 +195,12 @@ typedef struct dev_mprot_lock_s {
 
 typedef struct dev_gmm_s { // global mapped mem
 	uint32_t bit_maps[499];
+	uint32_t idx;
 	uint64_t mark;
 	struct dev_gmm_s *next;
 	const arena_chunk_t *prev_owner;
 	const arena_chunk_t *owner;
-	dev_mprot_lock_t lock __attribute__((aligned(4)));
-	uint8_t padding[8];
-	uint32_t idx;
+	const uint64_t pad[2];
 } __attribute__((packed)) dev_gmm_t;
 
 _Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
@@ -211,7 +210,7 @@ _Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
 // dev mprotect
 typedef struct dev_cmm_s { // chunk mapped mem
 	const extent_node_t __priv_node; // do not touch
-	bool hugepage;
+	const bool __priv_hugepage;
 	bool gmm_mapped;
 	uint32_t gmm_idx;
 	const arena_chunk_map_bits_t __priv_map_bits[1]; // do not touch
@@ -219,6 +218,20 @@ typedef struct dev_cmm_s { // chunk mapped mem
 } dev_cmm_t;
 
 _Static_assert(sizeof(dev_cmm_t) == 0x80, "Invalid CMM size");
+
+// Access for arena_chunk unused memory.
+typedef struct __attribute__((aligned(8))) dev_cmm_unused_s {
+	union {
+		extent_node_t node;
+		const uint8_t mem[0xcb30];
+	};
+	uint64_t mark;
+	struct dev_cmm_unused_s *prev;
+	struct dev_cmm_unused_s *next;
+	bool hugepage;
+} __attribute__((packed)) dev_cmm_unused_t;
+
+_Static_assert(sizeof(dev_cmm_unused_t) < 0xd000, "Invalid CMM_unused size");
 
 /* Arena chunk header. */
 struct arena_chunk_s {
@@ -235,7 +248,7 @@ struct arena_chunk_s {
 	 * platform on which jemalloc interacts with explicit transparent huge
 	 * page controls.
 	 */
-	bool			hugepage;
+	const bool			__hugepage;
 	const bool			__dev_gmm_mapped;
 	const uint32_t		__dev_gmm_idx;
 
@@ -249,6 +262,8 @@ struct arena_chunk_s {
 };
 
 _Static_assert(sizeof(struct arena_chunk_s) == 0x80, "Invalid arena_chunk_s size");
+_Static_assert(&((struct arena_chunk_s*)0)->__dev_gmm_mapped == &((dev_cmm_t*)0)->gmm_mapped, "Invalid arena_chunk_s __dev_gmm_mapped offset");
+_Static_assert(&((struct arena_chunk_s*)0)->__dev_gmm_idx == &((dev_cmm_t*)0)->gmm_idx, "Invalid arena_chunk_s gmm_idx offset");
 
 /*
  * Read-only information associated with each element of arena_t's bins array
@@ -860,8 +875,7 @@ arena_mapbitsp_get_const(const arena_chunk_t *chunk, size_t pageind)
 JEMALLOC_ALWAYS_INLINE size_t
 arena_mapbitsp_read(const size_t *mapbitsp)
 {
-	if (dev_is_gmm(mapbitsp) ||
-			((uintptr_t)mapbitsp & chunksize_mask) > 0x1008) {
+	if (dev_is_gmm(mapbitsp)) {
 		// was compressed to 32bits
 		return (size_t)(*(uint32_t*)mapbitsp);
 	}
@@ -992,8 +1006,7 @@ arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 {
 	dev_assert(mapbits <= (size_t)UINT32_MAX);
 
-	if (dev_is_gmm(mapbitsp) ||
-			((uintptr_t)mapbitsp & chunksize_mask) > 0x1008) {
+	if (dev_is_gmm(mapbitsp)) {
 		// compress to 32bits
 		*(uint32_t*)mapbitsp = (uint32_t)mapbits;
 		return;

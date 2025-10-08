@@ -137,18 +137,16 @@ dev_cmm_free_mm(dev_cmm_t *dchunk)
 {
 	dev_gmm_t *mm = &dev_mapped_mem[dchunk->gmm_idx];
 
-	dev_mut_lock(&mm->lock.m);
+	dev_assert(dchunk->gmm_mapped);
+	dev_assert(dchunk->gmm_idx < DEV_MM_COUNT);
+
+	dev_mut_lock(&dev_mm_lock);
+	dchunk->gmm_idx = ~(0U);
+	dchunk->gmm_mapped = false;
 	mm->next = dev_free_ptr;
 	dev_free_ptr = mm;
 	dev_n_freed++;
-	dev_mut_unlock(&mm->lock.m);
-}
-
-static dev_mprot_lock_t *
-dev_cmm_get_lock(dev_cmm_t *dchunk)
-{
-	dev_assert(dchunk->gmm_idx < DEV_MM_COUNT);
-	return &dev_mapped_mem[dchunk->gmm_idx].lock;
+	dev_mut_unlock(&dev_mm_lock);
 }
 
 void *
@@ -160,24 +158,6 @@ dev_cmm_get_bitmap(dev_cmm_t *dchunk, size_t idx)
 	dev_assert(idx < 499);
 
 	return &mm->bit_maps[idx];
-}
-
-JEMALLOC_ALWAYS_INLINE bool
-dev_lock_check(const dev_mprot_lock_t* lock, const arena_chunk_t *chunk,
-		const arena_t *arena)
-{
-	if (lock->check32 != (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1) {
-		return false;
-	}
-	return true;
-}
-
-JEMALLOC_ALWAYS_INLINE void
-dev_unlock(dev_mprot_lock_t *lock)
-{
-	if (lock != NULL) {
-		dev_mut_unlock(&lock->m);
-	}
 }
 
 /******************************************************************************/
@@ -204,48 +184,6 @@ dev_unprotect(arena_chunk_t *chunk)
 	}
 }
 
-static dev_mprot_lock_t*
-dev_get_mprot_lock(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-	dev_assert(dchunk->gmm_mapped);
-	return dev_cmm_get_lock(dchunk);
-}
-
-static dev_mprot_lock_t*
-dev_chunk_lock(arena_chunk_t *chunk, const arena_t *arena)
-{
-	dev_mprot_lock_t* lock = dev_get_mprot_lock(chunk);
-	dev_assert(dev_lock_check(lock, chunk, arena));
-	dev_mut_lock(&lock->m);
-	return lock;
-}
-
-static dev_mprot_lock_t *
-dev_lock_unprot(arena_chunk_t *chunk, const arena_t *arena)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	if (! dchunk->gmm_mapped) {
-		return NULL;
-	}
-	else {
-		dev_mprot_lock_t *lock = dev_chunk_lock(chunk, arena);
-		dev_assert(lock != NULL);
-		dev_unprotect(chunk);
-		return lock;
-	}
-}
-
-static void
-dev_prot_unlock(arena_chunk_t *chunk, dev_mprot_lock_t *lock)
-{
-	if (lock != NULL) {
-		dev_protect(chunk);
-		dev_unlock(lock);
-	}
-}
-
 static void
 dev_init_chunk(arena_chunk_t *chunk)
 {
@@ -253,23 +191,21 @@ dev_init_chunk(arena_chunk_t *chunk)
 
 	dev_assert(((uintptr_t)chunk & chunksize_mask) == 0);
 	dev_assert(chunk->node.en_size > chunksize_mask);
+	dchunk->gmm_mapped = false;
 
 	if (chunk->node.en_arena->ind == MPROT_STARTUP_ARENA) {
-		dchunk->gmm_mapped = false;
 		return;
 	}
 	else {
 		dev_gmm_t *gmm = dev_mm_alloc();
 
 		if (gmm != NULL) {
-			dev_mprot_lock_t* lock = &gmm->lock;
-			lock->m = 0;
-			lock->check32 = (uint32_t)((uintptr_t)chunk & 0xffffffff) * MULT + 1;
 			memset(gmm->bit_maps, 0, sizeof(gmm->bit_maps));
 			gmm->prev_owner = gmm->owner;
 			gmm->owner = chunk;
 			dchunk->gmm_mapped = true;
 			dchunk->gmm_idx = gmm->idx;
+			dev_protect(chunk);
 		}
 	}
 }
@@ -958,7 +894,8 @@ arena_chunk_init_hard(tsdn_t *tsdn, arena_t *arena)
 		return (NULL);
 
 	if (config_thp && opt_thp) {
-		chunk->hugepage = thp_initially_huge;
+		dev_cmm_unused_t *uchunk = (dev_cmm_unused_t*)chunk;
+		uchunk->hugepage = thp_initially_huge;
 	}
 
 	dev_init_chunk(chunk);
@@ -1003,53 +940,46 @@ arena_chunk_init_hard(tsdn_t *tsdn, arena_t *arena)
 	return (chunk);
 }
 
+#define dev_afirst(__arena) ql_first(&arena->achunks)
+
+static void
+dev_ql_tail_insert(arena_t *arena, arena_chunk_t *chunk)
+{
+	dev_cmm_unused_t *u = (dev_cmm_unused_t*)chunk;
+
+	u->next = u;
+	u->prev = u;
+
+	if (dev_afirst(arena) != NULL) {
+		dev_cmm_unused_t *first = (dev_cmm_unused_t *)dev_afirst(arena);
+		dev_cmm_unused_t *prev = first->prev;
+
+		u->prev = first->prev;
+		u->next = first;
+		prev->next = u;
+		first->prev = u;
+	}
+
+	dev_afirst(arena) = &u->next->node;
+}
+
 static arena_chunk_t *
 arena_chunk_alloc(tsdn_t *tsdn, arena_t *arena)
 {
 	arena_chunk_t *chunk;
 
-	if (arena->spare != NULL)
+	if (arena->spare != NULL) {
 		chunk = arena_chunk_init_spare(arena);
+//		printf("alloc spare %p\n", chunk);
+	}
 	else {
 		chunk = arena_chunk_init_hard(tsdn, arena);
+//		printf("alloc hard %p\n", chunk);
 		if (chunk == NULL)
 			return (NULL);
 	}
 
-	if (arena->ind != MPROT_STARTUP_ARENA) { // mprotect devbuild
-		extent_node_t *first = arena->achunks.qlh_first;
-		extent_node_t *prev = NULL;
-		dev_mprot_lock_t *first_lock = NULL;
-		dev_mprot_lock_t *prev_lock = NULL;
-
-		ql_elm_new(&chunk->node, ql_link);
-
-		if (first != NULL) {
-			first_lock = dev_lock_unprot((arena_chunk_t*)first, arena);
-
-			if (first->ql_link.qre_prev != first) {
-				prev = first->ql_link.qre_prev;
-				prev_lock = dev_lock_unprot((arena_chunk_t*)prev, arena);
-			}
-		}
-
-		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
-
-		if (prev != NULL) {
-			dev_prot_unlock((arena_chunk_t*)prev, prev_lock);
-		}
-
-		if (first != NULL) {
-			dev_prot_unlock((arena_chunk_t*)first, first_lock);
-		}
-
-		dev_protect(chunk);
-	}
-	else {
-		ql_elm_new(&chunk->node, ql_link);
-		ql_tail_insert(&arena->achunks, &chunk->node, ql_link);
-	}
-
+	dev_ql_tail_insert(arena, chunk);
 	arena_avail_insert(arena, chunk, map_bias, chunk_npages-map_bias);
 
 	return (chunk);
@@ -1065,16 +995,16 @@ arena_chunk_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
 
 	if (dchunk->gmm_mapped) {
+		dev_unprotect(chunk);
 		dev_cmm_free_mm(dchunk);
-		dchunk->gmm_idx = ~(0U);
-		dchunk->gmm_mapped = false;
 	}
 
 	chunk_deregister(chunk, &chunk->node);
 
 	sn = extent_node_sn_get(&chunk->node);
 	if (config_thp && opt_thp) {
-		hugepage = chunk->hugepage;
+		dev_cmm_unused_t *uchunk = (dev_cmm_unused_t*)chunk;
+		hugepage = uchunk->hugepage;
 	}
 	committed = (arena_mapbits_decommitted_get(chunk, map_bias) == 0);
 	if (!committed) {
@@ -1124,6 +1054,28 @@ arena_spare_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *spare)
 }
 
 static void
+dev_ql_remove(arena_t *arena, arena_chunk_t *chunk)
+{
+	dev_cmm_unused_t *u = (dev_cmm_unused_t*)chunk;
+	dev_cmm_unused_t *next = u->next;
+
+	if (dev_afirst(arena) == &u->node) {
+		dev_afirst(arena) = &next->node;
+	}
+
+	if (ql_first(&arena->achunks) != &u->node) {
+		dev_cmm_unused_t *prev = u->prev;
+
+		prev->next = u->next;
+		next->prev = u->prev;
+		u->next = u;
+		u->prev = u;
+	} else {
+		dev_afirst(arena) = NULL;
+	}
+}
+
+static void
 arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 {
 	arena_chunk_t *spare;
@@ -1141,39 +1093,7 @@ arena_chunk_dalloc(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 
 	/* Remove run from runs_avail, so that the arena does not use it. */
 	arena_avail_remove(arena, chunk, map_bias, chunk_npages-map_bias);
-
-	if (arena->ind != MPROT_STARTUP_ARENA) {
-		extent_node_t* next = NULL;
-		extent_node_t* prev = NULL;
-		dev_mprot_lock_t *lock = dev_lock_unprot(chunk, arena);
-		dev_mprot_lock_t *next_lock = NULL;
-		dev_mprot_lock_t *prev_lock = NULL;
-
-		if (chunk->node.ql_link.qre_next != &chunk->node) {
-			next = chunk->node.ql_link.qre_next;
-			next_lock = dev_lock_unprot((arena_chunk_t*)next, arena);
-			prev = chunk->node.ql_link.qre_prev;
-
-			if (next != prev) {
-				prev_lock = dev_lock_unprot((arena_chunk_t*)prev, arena);
-			}
-		}
-
-		ql_remove(&arena->achunks, &chunk->node, ql_link);
-
-		if (next != NULL) {
-			if (next != prev) {
-				dev_prot_unlock((arena_chunk_t*)prev, prev_lock);
-			}
-
-			dev_prot_unlock((arena_chunk_t*)next, next_lock);
-		}
-
-		dev_unlock(lock);
-	}
-	else {
-		ql_remove(&arena->achunks, &chunk->node, ql_link);
-	}
+	dev_ql_remove(arena, chunk);
 
 	spare = arena->spare;
 	arena->spare = chunk;
@@ -2066,6 +1986,7 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			    (arena_chunk_t *)CHUNK_ADDR2BASE(rdelm);
 			arena_chunk_map_misc_t *miscelm =
 			    arena_rd_to_miscelm(rdelm);
+			dev_cmm_unused_t *uchunk = (dev_cmm_unused_t *)chunk;
 			pageind = arena_miscelm_to_pageind(miscelm);
 			run_size = arena_mapbits_large_size_get(chunk, pageind);
 			npages = run_size >> LG_PAGE;
@@ -2076,11 +1997,9 @@ arena_purge_stashed(tsdn_t *tsdn, arena_t *arena, chunk_hooks_t *chunk_hooks,
 			 * use of THPs for this chunk until the chunk as a whole
 			 * is deallocated.
 			 */
-			if (config_thp && opt_thp && chunk->hugepage) {
-				dev_mprot_lock_t *lock = dev_lock_unprot(chunk, arena);
-				chunk->hugepage = pages_nohuge(chunk,
+			if (config_thp && opt_thp && uchunk->hugepage) {
+				uchunk->hugepage = pages_nohuge(chunk,
 				    chunksize);
-				dev_prot_unlock(chunk, lock);
 			}
 
 			assert(pageind + npages <= chunk_npages);
@@ -2283,6 +2202,8 @@ arena_reset(tsd_t *tsd, arena_t *arena)
 {
 	unsigned i;
 	extent_node_t *node;
+
+	dev_assert(0); // make sure arena is never reset in devbuild
 
 	/*
 	 * Locking in this function is unintuitive.  The caller guarantees that

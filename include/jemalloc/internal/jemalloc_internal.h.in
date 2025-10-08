@@ -25,7 +25,7 @@ static const bool config_debug =
 #ifdef JEMALLOC_DEBUG
     true
 #else
-    false
+    true
 #endif
     ;
 static const bool have_dss =
