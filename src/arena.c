@@ -1418,8 +1418,10 @@ arena_run_alloc_large_helper(arena_t *arena, size_t size, bool zero,
 {
 	arena_run_t *run = arena_run_first_best_fit(arena, size);
 	if (run != NULL) {
-		if (arena_run_split_large(arena, run, size, zero, commit))
+		if (arena_run_split_large(arena, run, size, zero, commit)) {
 			run = NULL;
+		}
+		dev_assert(run != NULL);
 	}
 	return (run);
 }
@@ -1445,8 +1447,10 @@ arena_run_alloc_large(tsdn_t *tsdn, arena_t *arena, size_t size, bool zero,
 	chunk = arena_chunk_alloc(tsdn, arena);
 	if (chunk != NULL) {
 		run = &arena_miscelm_get_mutable(chunk, map_bias)->run;
-		if (arena_run_split_large(arena, run, size, zero, commit))
+		if (arena_run_split_large(arena, run, size, zero, commit)) {
 			run = NULL;
+		}
+		dev_assert(run != NULL);
 		return (run);
 	}
 
