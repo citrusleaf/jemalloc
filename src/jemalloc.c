@@ -2240,6 +2240,7 @@ imallocx_body(size_t size, int flags, tsdn_t **tsdn, size_t *usize,
 
 	if (slow_path && unlikely(malloc_init())) {
 		*tsdn = NULL;
+		dev_assert(0); // slow_path = false
 		return (NULL);
 	}
 
@@ -2249,8 +2250,11 @@ imallocx_body(size_t size, int flags, tsdn_t **tsdn, size_t *usize,
 
 	if (likely(flags == 0)) {
 		szind_t ind = size2index(size);
-		if (unlikely(ind >= NSIZES))
+		if (unlikely(ind >= NSIZES)) {
+			malloc_printf("ind %u\n", ind);
+			dev_assert(0);
 			return (NULL);
+		}
 		if (config_stats || (config_prof && opt_prof) || (slow_path &&
 		    config_valgrind && unlikely(in_valgrind))) {
 			*usize = index2size(ind);
@@ -2258,6 +2262,7 @@ imallocx_body(size_t size, int flags, tsdn_t **tsdn, size_t *usize,
 		}
 
 		if (config_prof && opt_prof) {
+			dev_assert(0); // config_prof = false
 			return (ialloc_prof(tsd, *usize, ind, false,
 			    slow_path));
 		}
@@ -2285,7 +2290,14 @@ je_mallocx(size_t size, int flags)
 	if (likely(!malloc_slow)) {
 		p = imallocx_body(size, flags, &tsdn, &usize, false);
 		ialloc_post_check(p, tsdn, usize, "mallocx", false, false);
+
+		if (p == NULL) {
+			malloc_printf("malloc_slow %d\n", malloc_slow);
+			malloc_printf("je_mallocx(size=%zu, %d) -> NULL\n", size, flags);
+			dev_assert(p != NULL);
+		}
 	} else {
+//		dev_assert(0);
 		p = imallocx_body(size, flags, &tsdn, &usize, true);
 		ialloc_post_check(p, tsdn, usize, "mallocx", false, true);
 		UTRACE(0, size, p);

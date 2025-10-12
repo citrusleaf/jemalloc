@@ -186,13 +186,7 @@ typedef ph(arena_chunk_map_misc_t) arena_run_heap_t;
 
 #ifdef JEMALLOC_ARENA_STRUCTS_B
 
-#define MULT 3486784401u
-
-typedef struct dev_mprot_lock_s {
-	uint32_t	m;
-	uint32_t 	check32;
-} dev_mprot_lock_t;
-
+// dev mprotect
 typedef struct dev_gmm_s { // global mapped mem
 	uint32_t bit_maps[499];
 	uint32_t idx;
@@ -205,16 +199,14 @@ typedef struct dev_gmm_s { // global mapped mem
 
 _Static_assert(sizeof(dev_gmm_t) % 64 == 0, "Invalid GMM size");
 
-//#define DEV_CMM_N_BITMAPS 300
+#define DEV_MAPPED_NEED_MPROT	1
 
-// dev mprotect
 typedef struct dev_cmm_s { // chunk mapped mem
 	const extent_node_t __priv_node; // do not touch
 	const bool __priv_hugepage;
-	bool gmm_mapped;
+	uint8_t gmm_mapped;
 	uint32_t gmm_idx;
 	const arena_chunk_map_bits_t __priv_map_bits[1]; // do not touch
-//} __attribute__((packed)) dev_cmm_t;
 } dev_cmm_t;
 
 _Static_assert(sizeof(dev_cmm_t) == 0x80, "Invalid CMM size");
@@ -249,7 +241,7 @@ struct arena_chunk_s {
 	 * page controls.
 	 */
 	const bool			__hugepage;
-	const bool			__dev_gmm_mapped;
+	const uint8_t		__dev_gmm_mapped;
 	const uint32_t		__dev_gmm_idx;
 
 	/*
@@ -759,15 +751,6 @@ void	arena_sdalloc(tsdn_t *tsdn, void *ptr, size_t size, tcache_t *tcache,
 #if (defined(JEMALLOC_ENABLE_INLINE) || defined(JEMALLOC_ARENA_C_))
 #  ifdef JEMALLOC_ARENA_INLINE_A
 
-#define	dev_assert(e) do {							\
-	if (unlikely(!(e))) {				\
-		malloc_printf(						\
-		    "<jemalloc>: %s:%d: Failed assertion: \"%s\"\n",	\
-		    __FILE__, __LINE__, #e);				\
-		abort();						\
-	}								\
-} while (0)
-
 extern bool dev_is_gmm(const void *ptr);
 extern void *dev_cmm_get_bitmap(dev_cmm_t *dchunk, size_t idx);
 
@@ -775,12 +758,13 @@ JEMALLOC_ALWAYS_INLINE arena_chunk_map_bits_t *
 arena_bitselm_get_mutable(arena_chunk_t *chunk, size_t pageind)
 {
 	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	assert(pageind >= map_bias);
-	assert(pageind < chunk_npages);
+	dev_assert(pageind >= map_bias);
+	dev_assert(pageind < chunk_npages);
 
 	if (dchunk->gmm_mapped) {
-		dev_assert(((uintptr_t)chunk & chunksize_mask) == 0);
+		if (((uintptr_t)chunk & chunksize_mask) != 0) {
+			dev_assert(0);
+		}
 		return dev_cmm_get_bitmap(dchunk, pageind-map_bias);
 	}
 
@@ -877,7 +861,9 @@ arena_mapbitsp_read(const size_t *mapbitsp)
 {
 	if (dev_is_gmm(mapbitsp)) {
 		// was compressed to 32bits
-		return (size_t)(*(uint32_t*)mapbitsp);
+		uint32_t *p32 = (uint32_t *)mapbitsp;
+
+		return (size_t)__atomic_load_n(p32, __ATOMIC_RELAXED);
 	}
 
 	return (*mapbitsp);
@@ -1008,7 +994,8 @@ arena_mapbitsp_write(size_t *mapbitsp, size_t mapbits)
 
 	if (dev_is_gmm(mapbitsp)) {
 		// compress to 32bits
-		*(uint32_t*)mapbitsp = (uint32_t)mapbits;
+		uint32_t *p32 = (uint32_t *)mapbitsp;
+		__atomic_store_n(p32, (uint32_t)mapbits, __ATOMIC_RELAXED);
 		return;
 	}
 

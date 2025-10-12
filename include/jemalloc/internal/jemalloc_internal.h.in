@@ -1069,6 +1069,7 @@ iallocztm(tsdn_t *tsdn, size_t size, szind_t ind, bool zero, tcache_t *tcache,
 		arena_metadata_allocated_add(iaalloc(ret),
 		    isalloc(tsdn, ret, config_prof));
 	}
+	dev_assert(ret != NULL);
 	return (ret);
 }
 

@@ -30,74 +30,26 @@ unsigned	nhclasses; /* Number of huge size classes. */
 dev_gmm_t *dev_free_ptr = NULL;
 size_t dev_n_mapped_mem = 0;
 dev_gmm_t dev_mapped_mem[DEV_MM_COUNT];
-uint32_t dev_mm_lock = 0;
 uint32_t dev_n_freed = 0;
 
 _Static_assert(sizeof(dev_mapped_mem) == 2048*DEV_MM_COUNT, "dev_mapped_mem");
 
-inline static void
-sys_futex(void* uaddr, int op, int val)
-{
-	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
-}
-
-#define as_cas_acq(_target, _old_value, _new_value) __atomic_compare_exchange_n(_target, _old_value, _new_value, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
-#define as_load_rlx(_target) __atomic_load_n(_target, __ATOMIC_RELAXED)
-#define as_fas_acq(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_ACQUIRE)
-#define as_fas_rls(_target, _value) __atomic_exchange_n(_target, _value, __ATOMIC_RELEASE)
-
-static inline void
-dev_mut_lock(uint32_t* m)
-{
-	uint32_t zero = 0;
-
-	if (likely(as_cas_acq(m, &zero, 1))) {
-		return; // was not locked
-	}
-
-	if (as_load_rlx(m) == 2) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-
-	while (as_fas_acq(m, 2) != 0) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-}
-
-static inline void
-dev_mut_unlock(uint32_t* m)
-{
-	uint32_t check = as_fas_rls(m, 0);
-
-	if (unlikely(check == 2)) {
-		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
-	}
-	else {
-		dev_assert(check != 0);
-	}
-
-	dev_assert(check < 3);
-}
-
 static inline dev_gmm_t *
 dev_mm_get_freed()
 {
-	dev_gmm_t *mm = __atomic_load_n(&dev_free_ptr, __ATOMIC_RELAXED);
+	dev_gmm_t *mm;
+	dev_gmm_t *next;
 
-	if (dev_free_ptr != NULL) {
-		dev_mut_lock(&dev_mm_lock);
-
-		if ((mm = dev_free_ptr) == NULL) {
-			dev_mut_unlock(&dev_mm_lock);
+	do {
+		mm = __atomic_load_n(&dev_free_ptr, __ATOMIC_ACQUIRE);
+		if (mm == NULL) {
 			return NULL;
 		}
+		next = mm->next;
+	} while ( __atomic_compare_exchange_n(&dev_free_ptr, &mm, next, false,
+			__ATOMIC_RELEASE, __ATOMIC_RELAXED));
 
-		dev_free_ptr = mm->next;
-		dev_mut_unlock(&dev_mm_lock);
-		return mm;
-	}
-
-	return NULL;
+	return mm;
 }
 
 static dev_gmm_t *
@@ -133,20 +85,22 @@ dev_is_gmm(const void *ptr)
 }
 
 static void
-dev_cmm_free_mm(dev_cmm_t *dchunk)
+dev_cmm_free_mm(void *chunk_ptr, uint32_t gmm_idx)
 {
-	dev_gmm_t *mm = &dev_mapped_mem[dchunk->gmm_idx];
+	// Must use passed in gmm_idx as chunk may have been decommitted.
+	// Do not use contents of chunk.
+	dev_gmm_t *mm = &dev_mapped_mem[gmm_idx];
+	dev_gmm_t *head;
 
-	dev_assert(dchunk->gmm_mapped);
-	dev_assert(dchunk->gmm_idx < DEV_MM_COUNT);
+	dev_assert(gmm_idx < DEV_MM_COUNT);
 
-	dev_mut_lock(&dev_mm_lock);
-	dchunk->gmm_idx = ~(0U);
-	dchunk->gmm_mapped = false;
-	mm->next = dev_free_ptr;
-	dev_free_ptr = mm;
-	dev_n_freed++;
-	dev_mut_unlock(&dev_mm_lock);
+	do {
+		head = __atomic_load_n(&dev_free_ptr, __ATOMIC_RELAXED);
+		mm->next = head;
+	} while (! __atomic_compare_exchange_n(&dev_free_ptr, &head, mm, false,
+			__ATOMIC_RELEASE, __ATOMIC_RELAXED));
+
+	__atomic_fetch_add(&dev_n_freed, 1, __ATOMIC_RELAXED);
 }
 
 void *
@@ -163,25 +117,10 @@ dev_cmm_get_bitmap(dev_cmm_t *dchunk, size_t idx)
 /******************************************************************************/
 // arena_chunk_t
 static void
-dev_protect(arena_chunk_t *chunk)
-{
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm_mapped) {
-		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ);
-		dev_assert(ret == 0);
-	}
-}
-
-static void
 dev_unprotect(arena_chunk_t *chunk)
 {
-	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm_mapped) {
-		int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
-		dev_assert(ret == 0);
-	}
+	int ret = mprotect(chunk, 1 << LG_PAGE, PROT_READ | PROT_WRITE);
+	dev_assert(ret == 0);
 }
 
 static void
@@ -191,7 +130,7 @@ dev_init_chunk(arena_chunk_t *chunk)
 
 	dev_assert(((uintptr_t)chunk & chunksize_mask) == 0);
 	dev_assert(chunk->node.en_size > chunksize_mask);
-	dchunk->gmm_mapped = false;
+	dchunk->gmm_mapped = 0;
 
 	if (chunk->node.en_arena->ind == MPROT_STARTUP_ARENA) {
 		return;
@@ -203,9 +142,9 @@ dev_init_chunk(arena_chunk_t *chunk)
 			memset(gmm->bit_maps, 0, sizeof(gmm->bit_maps));
 			gmm->prev_owner = gmm->owner;
 			gmm->owner = chunk;
-			dchunk->gmm_mapped = true;
+			dchunk->gmm_mapped = DEV_MAPPED_NEED_MPROT;
 			dchunk->gmm_idx = gmm->idx;
-			dev_protect(chunk);
+			// mprotect called at alloc.c
 		}
 	}
 }
@@ -993,11 +932,8 @@ arena_chunk_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 	bool committed;
 	chunk_hooks_t chunk_hooks = CHUNK_HOOKS_INITIALIZER;
 	dev_cmm_t *dchunk = (dev_cmm_t*)chunk;
-
-	if (dchunk->gmm_mapped) {
-		dev_unprotect(chunk);
-		dev_cmm_free_mm(dchunk);
-	}
+	bool was_gmm_mapped = (dchunk->gmm_mapped != 0);
+	uint32_t gmm_idx = dchunk->gmm_idx; // save before header decommit
 
 	chunk_deregister(chunk, &chunk->node);
 
@@ -1007,6 +943,11 @@ arena_chunk_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 		hugepage = uchunk->hugepage;
 	}
 	committed = (arena_mapbits_decommitted_get(chunk, map_bias) == 0);
+
+	if (was_gmm_mapped) {
+		dev_unprotect(chunk);
+	}
+
 	if (!committed) {
 		/*
 		 * Decommit the header.  Mark the chunk as decommitted even if
@@ -1028,6 +969,10 @@ arena_chunk_discard(tsdn_t *tsdn, arena_t *arena, arena_chunk_t *chunk)
 		} else {
 			pages_nohuge(chunk, chunksize);
 		}
+	}
+
+	if (was_gmm_mapped) {
+		dev_cmm_free_mm(chunk, gmm_idx);
 	}
 
 	chunk_dalloc_cache(tsdn, arena, &chunk_hooks, (void *)chunk, chunksize,
@@ -1435,12 +1380,12 @@ arena_run_alloc_large(tsdn_t *tsdn, arena_t *arena, size_t size, bool zero,
 
 	assert(size <= arena_maxrun);
 	assert(size == PAGE_CEILING(size));
-
 	/* Search the arena's chunks for the lowest best fit. */
 	run = arena_run_alloc_large_helper(arena, size, zero, commit);
 	if (run != NULL)
 		return (run);
-
+	// else
+	// 	malloc_printf("arena_run_alloc_large: run = NULL\n");
 	/*
 	 * No usable runs.  Create a new chunk from which to allocate the run.
 	 */
@@ -1452,6 +1397,9 @@ arena_run_alloc_large(tsdn_t *tsdn, arena_t *arena, size_t size, bool zero,
 		}
 		dev_assert(run != NULL);
 		return (run);
+	}
+	else {
+		malloc_printf("arena_run_alloc_large: chunk = NULL\n");
 	}
 
 	/*

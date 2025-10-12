@@ -11,6 +11,12 @@
 		abort();						\
 	}								\
 } while (0)
+
+#define dev_assert(e) do {	\
+	if (unlikely(!(e))) {	\
+		abort();			\
+	}						\
+} while (0)
 #endif
 
 #ifndef not_reached
@@ -41,5 +47,3 @@
 		not_implemented();					\
 } while (0)
 #endif
-
-
