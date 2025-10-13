@@ -9,6 +9,12 @@
 	}								\
 } while (0)
 
+#define	dev_assert(e) do {							\
+	if (!(e)) {					\
+		abort();						\
+	}								\
+} while (0)
+
 #define	not_reached() do {						\
 	if (config_debug) {						\
 		malloc_write("<jemalloc>: Unreachable code reached\n");	\

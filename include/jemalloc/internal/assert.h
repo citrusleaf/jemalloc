@@ -11,7 +11,9 @@
 		abort();						\
 	}								\
 } while (0)
+#endif
 
+#ifndef dev_assert
 #define dev_assert(e) do {	\
 	if (unlikely(!(e))) {	\
 		abort();			\
