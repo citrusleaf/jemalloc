@@ -172,10 +172,10 @@ pages_purge(void *addr, size_t size)
 	unzeroed = true;
 #elif (defined(JEMALLOC_PURGE_MADVISE_FREE) || \
     defined(JEMALLOC_PURGE_MADVISE_DONTNEED))
-#  if defined(JEMALLOC_PURGE_MADVISE_FREE)
-#    define JEMALLOC_MADV_PURGE MADV_FREE
-#    define JEMALLOC_MADV_ZEROS false
-#  elif defined(JEMALLOC_PURGE_MADVISE_DONTNEED)
+// #  if defined(JEMALLOC_PURGE_MADVISE_FREE)
+// #    define JEMALLOC_MADV_PURGE MADV_FREE
+// #    define JEMALLOC_MADV_ZEROS false
+// #  elif defined(JEMALLOC_PURGE_MADVISE_DONTNEED)
 #    define JEMALLOC_MADV_PURGE MADV_DONTNEED
 #    define JEMALLOC_MADV_ZEROS true
 #  else
