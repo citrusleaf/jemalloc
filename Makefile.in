@@ -208,6 +208,8 @@ TESTS_INTEGRATION := $(srcroot)test/integration/aligned_alloc.c \
 	$(srcroot)test/integration/thread_tcache_enabled.c \
 	$(srcroot)test/integration/xallocx.c \
 	$(srcroot)test/integration/chunk.c
+ASD_SRCS := $(srcroot)test/asd/asd.c $(srcroot)test/asd/asd_utils.c
+ASD_OBJS := $(ASD_SRCS:$(srcroot)%.c=$(objroot)%.$(O))
 TESTS_STRESS := $(srcroot)test/stress/microbench.c
 TESTS := $(TESTS_UNIT) $(TESTS_INTEGRATION) $(TESTS_STRESS)
 
@@ -223,7 +225,7 @@ C_TESTLIB_OBJS := $(C_TESTLIB_UNIT_OBJS) $(C_TESTLIB_INTEGRATION_OBJS) $(C_UTIL_
 TESTS_UNIT_OBJS := $(TESTS_UNIT:$(srcroot)%.c=$(objroot)%.$(O))
 TESTS_INTEGRATION_OBJS := $(TESTS_INTEGRATION:$(srcroot)%.c=$(objroot)%.$(O))
 TESTS_STRESS_OBJS := $(TESTS_STRESS:$(srcroot)%.c=$(objroot)%.$(O))
-TESTS_OBJS := $(TESTS_UNIT_OBJS) $(TESTS_INTEGRATION_OBJS) $(TESTS_STRESS_OBJS)
+TESTS_OBJS := $(TESTS_UNIT_OBJS) $(TESTS_INTEGRATION_OBJS) $(TESTS_STRESS_OBJS) $(ASD_OBJS)
 
 .PHONY: all dist build_doc_html build_doc_man build_doc
 .PHONY: install_bin install_include install_lib
@@ -256,6 +258,7 @@ ifdef CC_MM
 -include $(C_JET_OBJS:%.$(O)=%.d)
 -include $(C_TESTLIB_OBJS:%.$(O)=%.d)
 -include $(TESTS_OBJS:%.$(O)=%.d)
+-include $(ASD_OBJS:%.$(O)=%.d)
 endif
 
 $(C_OBJS): $(objroot)src/%.$(O): $(srcroot)src/%.c
@@ -276,6 +279,9 @@ $(TESTS_INTEGRATION_OBJS): CPPFLAGS += -DJEMALLOC_INTEGRATION_TEST
 $(TESTS_STRESS_OBJS): CPPFLAGS += -DJEMALLOC_STRESS_TEST
 $(TESTS_OBJS): $(objroot)test/%.$(O): $(srcroot)test/%.c
 $(TESTS_OBJS): CPPFLAGS += -I$(srcroot)test/include -I$(objroot)test/include
+$(ASD_OBJS): $(objroot)test/asd/%.$(O): $(srcroot)test/asd/%.c
+$(ASD_OBJS): CPPFLAGS += -DJEMALLOC_INTEGRATION_TEST -I$(srcroot)test/include -I$(objroot)test/include -I$(srcroot)test/asd
+$(ASD_OBJS): CFLAGS := $(filter-out -std=% -Werror=declaration-after-statement,$(CFLAGS)) -std=gnu99
 ifneq ($(IMPORTLIB),$(SO))
 $(C_OBJS) $(C_JET_OBJS): CPPFLAGS += -DDLLEXPORT
 endif
@@ -325,6 +331,10 @@ $(objroot)test/integration/%$(EXE): $(objroot)test/integration/%.$(O) $(C_TESTLI
 $(objroot)test/stress/%$(EXE): $(objroot)test/stress/%.$(O) $(C_JET_OBJS) $(C_TESTLIB_STRESS_OBJS) $(objroot)lib/$(LIBJEMALLOC).$(IMPORTLIB)
 	@mkdir -p $(@D)
 	$(CC) $(TEST_LD_MODE) $(LDTARGET) $(filter %.$(O),$^) $(call RPATH,$(objroot)lib) $(objroot)lib/$(LIBJEMALLOC).$(IMPORTLIB) $(LDFLAGS) $(filter-out -lm,$(LIBS)) $(LM) $(EXTRA_LDFLAGS)
+
+$(objroot)test/asd/asd$(EXE): $(ASD_OBJS) $(C_TESTLIB_INTEGRATION_OBJS) $(C_UTIL_INTEGRATION_OBJS) $(objroot)lib/$(LIBJEMALLOC).$(IMPORTLIB)
+	@mkdir -p $(@D)
+	$(CC) $(TEST_LD_MODE) $(LDTARGET) $(filter %.$(O),$^) $(call RPATH,$(objroot)lib) $(LJEMALLOC) $(LDFLAGS) $(filter-out -lm,$(filter -lrt -lpthread,$(LIBS))) $(LM) $(EXTRA_LDFLAGS)
 
 build_lib_shared: $(DSOS)
 build_lib_static: $(STATIC_LIBS)
@@ -394,6 +404,7 @@ check_unit_dir:
 	@mkdir -p $(objroot)test/unit
 check_integration_dir:
 	@mkdir -p $(objroot)test/integration
+	@mkdir -p $(objroot)test/asd
 stress_dir:
 	@mkdir -p $(objroot)test/stress
 check_dir: check_unit_dir check_integration_dir
@@ -415,6 +426,9 @@ check_integration: tests_integration check_integration_dir
 stress: tests_stress stress_dir
 	$(SHELL) $(objroot)test/test.sh $(TESTS_STRESS:$(srcroot)%.c=$(objroot)%)
 check: check_unit check_integration check_integration_decay check_integration_prof
+
+asd: $(objroot)test/asd/asd$(EXE) check_integration_dir
+	$(SHELL) $(objroot)test/test.sh $(objroot)test/asd/asd
 
 ifeq ($(enable_code_coverage), 1)
 coverage_unit: check_unit
@@ -464,11 +478,16 @@ clean:
 	rm -f $(C_TESTLIB_OBJS:%.$(O)=%.gcda)
 	rm -f $(C_TESTLIB_OBJS:%.$(O)=%.gcno)
 	rm -f $(TESTS_OBJS:%.$(O)=%$(EXE))
+	rm -f $(objroot)test/asd/asd$(EXE)
 	rm -f $(TESTS_OBJS)
 	rm -f $(TESTS_OBJS:%.$(O)=%.d)
+	rm -f $(ASD_OBJS)
+	rm -f $(ASD_OBJS:%.$(O)=%.d)
 	rm -f $(TESTS_OBJS:%.$(O)=%.gcda)
 	rm -f $(TESTS_OBJS:%.$(O)=%.gcno)
 	rm -f $(TESTS_OBJS:%.$(O)=%.out)
+	rm -f $(ASD_OBJS:%.$(O)=%.gcda)
+	rm -f $(ASD_OBJS:%.$(O)=%.gcno)
 	rm -f $(DSOS) $(STATIC_LIBS)
 	rm -f $(objroot)*.gcov.*
 
