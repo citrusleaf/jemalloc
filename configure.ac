@@ -1305,8 +1305,11 @@ AC_ARG_WITH([version],
     fi
     echo "$with_version" > "${objroot}VERSION"
   ], [
-    dnl Set VERSION if source directory is inside a git repository.
-    if test "x`test ! \"${srcroot}\" && cd \"${srcroot}\"; git rev-parse --is-inside-work-tree 2>/dev/null`" = "xtrue" ; then
+    dnl A tracked VERSION file wins over git: it is the only version input that
+    dnl is identical no matter how the tree was obtained (deep clone, shallow
+    dnl clone, or source archive with no .git at all).
+    if test ! -e "${srcroot}VERSION" &&
+       test "x`test ! \"${srcroot}\" && cd \"${srcroot}\"; git rev-parse --is-inside-work-tree 2>/dev/null`" = "xtrue" ; then
       dnl Pattern globs aren't powerful enough to match both single- and
       dnl double-digit version numbers, so iterate over patterns to support up
       dnl to version 99.99.99 without any accidental matches.
