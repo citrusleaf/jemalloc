@@ -36,8 +36,9 @@ any of the following arguments (not a definitive list) to 'configure':
     and /usr/local/man.
 
 --with-version=<major>.<minor>.<bugfix>-<nrev>-g<gid>
-    Use the specified version string rather than trying to generate one (if in
-    a git repository) or use existing the VERSION file (if present).
+    Use the specified version string rather than using the tracked VERSION.src
+    file (if present), trying to generate one (if in a git repository), or
+    using the existing VERSION file (if present).
 
 --with-rpath=<colon-separated-rpath>
     Embed one or more library paths, so that libjemalloc can find the libraries

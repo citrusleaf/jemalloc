@@ -1305,11 +1305,14 @@ AC_ARG_WITH([version],
     fi
     echo "$with_version" > "${objroot}VERSION"
   ], [
-    dnl A tracked VERSION file wins over git: it is the only version input that
-    dnl is identical no matter how the tree was obtained (deep clone, shallow
-    dnl clone, or source archive with no .git at all).
-    if test ! -e "${srcroot}VERSION" &&
-       test "x`test ! \"${srcroot}\" && cd \"${srcroot}\"; git rev-parse --is-inside-work-tree 2>/dev/null`" = "xtrue" ; then
+    dnl VERSION.src is a tracked input and wins over git: it is the only
+    dnl version source that reads the same however the tree was obtained (deep
+    dnl clone, shallow clone, or source archive with no .git at all). VERSION
+    dnl itself stays a generated output, so neither relclean nor --with-version
+    dnl can clobber a tracked file.
+    if test -e "${srcroot}VERSION.src" ; then
+      cp "${srcroot}VERSION.src" "${objroot}VERSION"
+    elif test "x`test ! \"${srcroot}\" && cd \"${srcroot}\"; git rev-parse --is-inside-work-tree 2>/dev/null`" = "xtrue" ; then
       dnl Pattern globs aren't powerful enough to match both single- and
       dnl double-digit version numbers, so iterate over patterns to support up
       dnl to version 99.99.99 without any accidental matches.
